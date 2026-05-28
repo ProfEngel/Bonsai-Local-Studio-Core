@@ -6,9 +6,6 @@ Image generation studio for FLUX.2 Klein on-device. Three components:
 - **`backend_gpu/`** — separate FastAPI server for the GPU arm; deployed to a CUDA host.
 - **`frontend/`** — Next.js web client that talks to `backend/`.
 
-The iOS / Mac Catalyst SwiftUI app ("Bonsai Image") lives in its own repo:
-[`PrismML-Eng/bonsai-ios-app`](https://github.com/PrismML-Eng/bonsai-ios-app).
-
 Per-component setup, API contracts, and deployment lives under [`docs/`](docs/). High-level pointers:
 
 - [`docs/backend.md`](docs/backend.md) — `/generate` API + the backend selectors.
