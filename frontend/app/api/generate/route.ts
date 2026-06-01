@@ -1,6 +1,7 @@
 import { MODERATION_REJECT_MESSAGE, validatePrompt } from "@/lib/prompt-moderator";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://127.0.0.1:8000";
+export const maxDuration = 600;
 
 export async function POST(request: Request) {
   const payload = await request.text();
