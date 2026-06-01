@@ -33,7 +33,8 @@ const MODE_OPTIONS: { value: Mode; label: string }[] = [
 
 const GENERATE_PATH = "/api/generate";
 const BATCH_SIZE = 4;
-const RENDER_TIMEOUT_MS = 120_000;
+const RENDER_TIMEOUT_MINUTES = 10;
+const RENDER_TIMEOUT_MS = RENDER_TIMEOUT_MINUTES * 60_000;
 const ABORT_REASON_USER = "user-cancel";
 const ABORT_REASON_TIMEOUT = "timeout";
 
@@ -232,7 +233,10 @@ export function StudioClient() {
             const reason = String(controller.signal.reason ?? "");
             if (reason === ABORT_REASON_USER) return { ok: false, error: "", cancelled: true };
             if (reason === ABORT_REASON_TIMEOUT) {
-              return { ok: false, error: "Render timed out after 120 seconds." };
+              return {
+                ok: false,
+                error: `Render timed out after ${RENDER_TIMEOUT_MINUTES} minutes.`,
+              };
             }
           }
           void err;
