@@ -534,7 +534,13 @@ async def _run_goose_harness(
     response_instruction: str,
 ) -> str:
     """Run one constrained, ephemeral Goose job without shell/computer extensions."""
-    goose = shutil.which("goose") or "/opt/homebrew/bin/goose"
+    goose_candidates = (
+        shutil.which("goose"),
+        str(Path.home() / ".local" / "bin" / "goose"),
+        "/opt/homebrew/bin/goose",
+        "/usr/local/bin/goose",
+    )
+    goose = next((candidate for candidate in goose_candidates if candidate and Path(candidate).is_file()), "")
     if not Path(goose).is_file():
         raise HTTPException(status_code=503, detail="Goose ist lokal nicht verfügbar. Bitte Goose installieren oder den allgemeinen Chat verwenden.")
     history = "\n\n".join(
