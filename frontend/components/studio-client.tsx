@@ -7,7 +7,6 @@ import {
   backendFor,
   type ModelFamily,
 } from "@/lib/backends";
-import { MODERATION_REJECT_MESSAGE, validatePrompt } from "@/lib/prompt-moderator";
 import {
   DEFAULT_RESOLUTION_ID,
   RESOLUTIONS,
@@ -24,6 +23,7 @@ import { SiteNav } from "@/components/site-nav";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { readStudioSettings } from "@/lib/studio-settings";
 
 type Mode = "single" | "batch";
 const MODE_OPTIONS: { value: Mode; label: string }[] = [
@@ -37,6 +37,9 @@ const RENDER_TIMEOUT_MINUTES = 10;
 const RENDER_TIMEOUT_MS = RENDER_TIMEOUT_MINUTES * 60_000;
 const ABORT_REASON_USER = "user-cancel";
 const ABORT_REASON_TIMEOUT = "timeout";
+
+type AvailableLora = { name: string; size_bytes: number };
+type SelectedLora = { name: string; scale: number };
 
 const SAMPLE_PROMPTS = [
   "A bonsai tree in a quiet ceramic studio, soft morning light, shallow depth of field",
@@ -69,6 +72,12 @@ export function StudioClient() {
   const { kind, supportedFamilies, defaultFamily } = useBackends();
 
   const [prompt, setPrompt] = useState("");
+  const [promptOptimizerEnabled, setPromptOptimizerEnabled] = useState(false);
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  const [loras, setLoras] = useState<AvailableLora[]>([]);
+  const [loraDirectory, setLoraDirectory] = useState<string | null>(null);
+  const [selectedLoras, setSelectedLoras] = useState<SelectedLora[]>([]);
+  const [isLoraPanelOpen, setIsLoraPanelOpen] = useState(false);
   const [seed, setSeed] = useState(42);
   const [steps, setSteps] = useState(4);
   const [resolutionId, setResolutionId] = useState<string>(DEFAULT_RESOLUTION_ID);
@@ -79,7 +88,8 @@ export function StudioClient() {
   useEffect(() => {
     if (!supportedFamilies.length) return;
     if (!supportedFamilies.includes(selectedFamily)) {
-      setSelectedFamily(defaultFamily);
+      const frame = window.requestAnimationFrame(() => setSelectedFamily(defaultFamily));
+      return () => window.cancelAnimationFrame(frame);
     }
   }, [supportedFamilies, defaultFamily, selectedFamily]);
   const familyOptions = useMemo(
@@ -139,6 +149,30 @@ export function StudioClient() {
   }, [resolutionId]);
 
   useEffect(() => {
+    const settingsFrame = window.requestAnimationFrame(() => {
+      setPromptOptimizerEnabled(readStudioSettings().promptOptimizerEnabled);
+    });
+    let active = true;
+    void fetch("/api/loras", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await parseError(response));
+        return response.json() as Promise<{ directory?: string; loras?: AvailableLora[] }>;
+      })
+      .then((payload) => {
+        if (!active) return;
+        setLoras(payload.loras ?? []);
+        setLoraDirectory(payload.directory ?? null);
+      })
+      .catch(() => {
+        if (active) setLoras([]);
+      });
+    return () => {
+      window.cancelAnimationFrame(settingsFrame);
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     const el = promptRef.current;
     if (!el) return;
     el.style.height = "0px";
@@ -150,6 +184,26 @@ export function StudioClient() {
 
   const handleRandomizeSeed = useCallback(() => {
     setSeed(Math.floor(Math.random() * 2 ** 31));
+  }, []);
+
+  const toggleLora = useCallback((lora: AvailableLora) => {
+    setError(null);
+    setSelectedLoras((current) => {
+      if (current.some((selected) => selected.name === lora.name)) {
+        return current.filter((selected) => selected.name !== lora.name);
+      }
+      if (current.length >= 2) {
+        setError("Bonsai Studio supports a maximum of two LoRA adapters at a time.");
+        return current;
+      }
+      return [...current, { name: lora.name, scale: 1 }];
+    });
+  }, []);
+
+  const setLoraScale = useCallback((name: string, scale: number) => {
+    setSelectedLoras((current) => current.map((adapter) => (
+      adapter.name === name ? { ...adapter, scale: Math.max(0, Math.min(2, scale)) } : adapter
+    )));
   }, []);
 
   const handleSelectEntry = useCallback((entry: HistoryEntry) => {
@@ -178,12 +232,6 @@ export function StudioClient() {
       event.preventDefault();
       if (generateDisabled) return;
 
-      const verdict = validatePrompt(prompt);
-      if (!verdict.ok && verdict.reason === "moderation") {
-        setError(MODERATION_REJECT_MESSAGE);
-        return;
-      }
-
       cancelledRef.current = false;
       setIsLoading(true);
       setError(null);
@@ -198,6 +246,47 @@ export function StudioClient() {
         return;
       }
       const backendForRequest = resolvedBackend;
+      let effectivePrompt = prompt;
+      if (promptOptimizerEnabled) {
+        const optimizerSettings = readStudioSettings();
+        if (!optimizerSettings.promptOptimizerEnabled) {
+          setError("Enable and save the prompt optimizer in Studio settings first.");
+          setIsLoading(false);
+          return;
+        }
+        setIsOptimizing(true);
+        try {
+          const response = await fetch("/api/optimize-prompt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              prompt,
+              llm_url: optimizerSettings.llmUrl,
+              model: optimizerSettings.model,
+              system_prompt: optimizerSettings.systemPrompt,
+            }),
+          });
+          if (!response.ok) {
+            setError(await parseError(response));
+            setIsLoading(false);
+            return;
+          }
+          const payload = (await response.json()) as { prompt?: string };
+          if (!payload.prompt?.trim()) {
+            setError("The local LLM returned no usable optimized prompt.");
+            setIsLoading(false);
+            return;
+          }
+          effectivePrompt = payload.prompt.trim();
+          setPrompt(effectivePrompt);
+        } catch {
+          setError("Could not reach the local prompt optimizer.");
+          setIsLoading(false);
+          return;
+        } finally {
+          setIsOptimizing(false);
+        }
+      }
       const generateOne = async (
         effectiveSeed: number,
       ): Promise<
@@ -218,12 +307,13 @@ export function StudioClient() {
             headers: { "Content-Type": "application/json" },
             signal: controller.signal,
             body: JSON.stringify({
-              prompt,
+              prompt: effectivePrompt,
               seed: effectiveSeed,
               steps,
               height: resolution.height,
               width: resolution.width,
               backend: backendForRequest,
+              lora_adapters: selectedLoras,
             }),
           });
         } catch (err) {
@@ -249,7 +339,7 @@ export function StudioClient() {
           const blob = await response.blob();
           const totalMs = performance.now() - startedAt;
           const entry = pushHistory({
-            prompt,
+            prompt: effectivePrompt,
             params: { seed: effectiveSeed, steps, backend: backendForRequest, resolutionId },
             imageBlob: blob,
           });
@@ -303,12 +393,14 @@ export function StudioClient() {
       generateDisabled,
       mode,
       prompt,
+      promptOptimizerEnabled,
       pushHistory,
       resolution.height,
       resolution.width,
       resolutionId,
       resolvedBackend,
       seed,
+      selectedLoras,
       steps,
     ],
   );
@@ -346,6 +438,75 @@ export function StudioClient() {
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
               />
+
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border-strong bg-surface-strong px-3 py-2.5">
+                <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-muted-strong">
+                  <input
+                    type="checkbox"
+                    checked={promptOptimizerEnabled}
+                    onChange={(event) => setPromptOptimizerEnabled(event.target.checked)}
+                    disabled={isLoading}
+                    className="size-4 accent-[var(--accent)]"
+                  />
+                  Prompt mit lokalem LLM verbessern
+                </label>
+                <span className="text-[10px] text-muted">Konfiguration über das Zahnrad oben rechts</span>
+              </div>
+
+              <section className="rounded-xl border border-border-strong bg-surface-strong px-3 py-3">
+                <button
+                  type="button"
+                  onClick={() => setIsLoraPanelOpen((open) => !open)}
+                  aria-expanded={isLoraPanelOpen}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <span className="text-xs font-semibold text-muted-strong">LoRA adapters <span className="font-normal text-muted">(max. 2)</span></span>
+                  <span className="flex items-center gap-2 text-[10px] text-muted">
+                    {selectedLoras.length > 0 ? `${selectedLoras.length} ausgewählt` : "Optional"}
+                    <ChevronDown className={cn("size-4 transition-transform", isLoraPanelOpen && "rotate-180")} />
+                  </span>
+                </button>
+                {isLoraPanelOpen && (loras.length > 0 ? (
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    {loras.map((lora) => {
+                      const selected = selectedLoras.find((adapter) => adapter.name === lora.name);
+                      return (
+                        <div key={lora.name} className="rounded-lg border border-border bg-background/30 px-3 py-2">
+                          <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-strong">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(selected)}
+                              disabled={isLoading}
+                              onChange={() => toggleLora(lora)}
+                              className="size-4 accent-[var(--accent)]"
+                            />
+                            <span className="min-w-0 truncate" title={lora.name}>{lora.name}</span>
+                          </label>
+                          {selected ? (
+                            <div className="mt-2 flex items-center gap-2">
+                              <input
+                                aria-label={`Weight for ${lora.name}`}
+                                type="range"
+                                min="0"
+                                max="2"
+                                step="0.05"
+                                value={selected.scale}
+                                onChange={(event) => setLoraScale(lora.name, Number(event.target.value))}
+                                disabled={isLoading}
+                                className="h-1 flex-1 accent-[var(--accent)]"
+                              />
+                              <span className="w-8 text-right font-mono text-[10px] text-muted">{selected.scale.toFixed(2)}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-muted">No LoRA files found yet. Add Flux2/Klein <code>.safetensors</code> adapters to <code>{loraDirectory ?? "the Studio loras folder"}</code> and reload.</p>
+                ))}
+                {isLoraPanelOpen && selectedLoras.length > 0 ? <p className="mt-3 text-[10px] text-muted">Das Modell lädt beim Ändern der Auswahl oder Gewichtung neu.</p> : null}
+              </section>
 
               {/* Compact settings row */}
               <div className="flex flex-wrap items-end gap-2 border-t border-border/60 pt-2">
@@ -424,10 +585,10 @@ export function StudioClient() {
                   <span className="text-[9px] font-semibold uppercase tracking-[0.18em] text-muted">Steps</span>
                   <Input
                     type="number"
-                    min={1}
+                    min={2}
                     step={1}
                     value={steps}
-                    onChange={(e) => setSteps(coerceInt(e.target.value, steps, 1))}
+                    onChange={(e) => setSteps(coerceInt(e.target.value, steps, 2))}
                     className="h-9 w-20 text-xs"
                   />
                 </div>
@@ -477,7 +638,7 @@ export function StudioClient() {
                       {isLoading
                         ? mode === "batch" && batchProgress
                           ? `${Math.min(batchProgress.done + 1, batchProgress.total)} / ${batchProgress.total}`
-                          : "Generating…"
+                          : isOptimizing ? "Optimizing prompt…" : "Generating…"
                         : "Generate"}
                     </span>
                   </Button>

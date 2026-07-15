@@ -2,17 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+from datetime import datetime, timedelta
 import gc
+import html
+import io
+import json
 import logging
 import os
+import re
 import time
+import xml.etree.ElementTree as ET
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
+from typing import Literal
+from urllib.parse import parse_qs, unquote, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
 import mlx.core as mx
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
+from pypdf import PdfReader
 
 from backend.pipeline import (
     BACKEND_TO_FAMILY,
@@ -60,6 +72,45 @@ _BACKENDS_PROBE_TTL_SECONDS: float = float(
 # fixed per process today, but keying on it keeps the cache correct if a
 # future change ever flips it mid-lifetime.
 _backends_cache: dict[tuple[bool, BackendKind], tuple[float, dict]] = {}
+
+DEFAULT_PROMPT_OPTIMIZER_SYSTEM_PROMPT = (
+    "You improve prompts for a Flux2 Klein image model. Return exactly one English "
+    "image prompt, one sentence, at most 60 words, with no repetition or explanation. "
+    "Preserve the user's subject and intent; add useful visual details such as "
+    "composition, lighting, materials and style."
+)
+
+DEFAULT_CHAT_SYSTEM_PROMPT = (
+    "You are Bonsai, a helpful local assistant. Answer clearly and honestly in the "
+    "user's language and use concise, well-formed Markdown. If WEB SEARCH RESULTS "
+    "are supplied, answer factual claims only from those results, cite them as [1], "
+    "[2] and do not use model memory. If the results do not answer the question, say "
+    "that the search was insufficient instead of inventing an answer. Interpret relative "
+    "dates such as today and yesterday from the supplied Europe/Berlin timestamp. "
+    "Image attachments are opaque to you: never claim to see, read or describe their "
+    "pixels. Ask for a local vision model when image analysis is required."
+)
+
+BERLIN_TIMEZONE = ZoneInfo("Europe/Berlin")
+CHAT_AGENTS_DIR = Path(
+    os.getenv(
+        "BONSAI_CHAT_AGENTS_DIR",
+        str(Path.home() / ".bonsai-studio" / "agents"),
+    )
+).expanduser()
+
+
+def _validate_local_llm_endpoint(value: str) -> str:
+    """Allow only an explicitly configured loopback OpenAI-compatible endpoint."""
+    normalized = value.rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("The local LLM may only be called through a loopback HTTP endpoint.")
+    if parsed.username or parsed.password or not parsed.port:
+        raise ValueError("Use a local HTTP endpoint with an explicit port, for example http://127.0.0.1:8081/v1.")
+    if not parsed.path.rstrip("/").endswith("/v1"):
+        raise ValueError("The endpoint must end in /v1, for example http://127.0.0.1:8081/v1.")
+    return normalized
 
 
 def _clear_backends_cache() -> None:
@@ -143,7 +194,8 @@ def _get_backends_payload(
 class GenerateRequest(BaseModel):
     prompt: str = Field(min_length=1)
     seed: int = DEFAULT_SEED
-    steps: int = Field(default=DEFAULT_STEPS, ge=1)
+    # The Flux flow-matching scheduler interpolates between at least two points.
+    steps: int = Field(default=DEFAULT_STEPS, ge=2)
     guidance: float = Field(default=DEFAULT_GUIDANCE, ge=0.0)
     backend: Backend | SkipJsonSchema[None] = Field(default=None)
     height: int = Field(default=DEFAULT_HEIGHT, ge=16)
@@ -151,6 +203,375 @@ class GenerateRequest(BaseModel):
     model_path: str | None = Field(default=None)
     tiled_vae: bool | None = Field(default=None)
     max_sequence_length: int | None = Field(default=None, ge=1)
+    lora_adapters: list["LoraAdapter"] = Field(default_factory=list, max_length=2)
+
+    @model_validator(mode="after")
+    def _validate_lora_adapters(self) -> "GenerateRequest":
+        names = [adapter.name for adapter in self.lora_adapters]
+        if len(set(names)) != len(names):
+            raise ValueError("Each LoRA adapter can be selected only once.")
+        return self
+
+
+class LoraAdapter(BaseModel):
+    """One local Flux2/Klein LoRA chosen from the Studio's loras/ directory."""
+
+    name: str = Field(min_length=1, max_length=255)
+    scale: float = Field(default=1.0, ge=0.0, le=2.0)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        candidate = Path(value)
+        if candidate.name != value or candidate.suffix.lower() != ".safetensors":
+            raise ValueError("LoRA name must be a .safetensors filename without a path.")
+        return value
+
+
+def _lora_directory() -> Path:
+    """Return the explicitly configured local LoRA folder, never a caller path."""
+    raw = os.getenv("MFLUX_STUDIO_LORA_DIR")
+    if raw is None:
+        raise ValueError("MFLUX_STUDIO_LORA_DIR is not configured.")
+    directory = Path(raw).expanduser()
+    if not directory.is_absolute():
+        raise ValueError("MFLUX_STUDIO_LORA_DIR must be an absolute path.")
+    return directory.resolve()
+
+
+def _resolve_lora_adapters(adapters: list[LoraAdapter]) -> tuple[tuple[str, ...], tuple[float, ...]]:
+    if not adapters:
+        return (), ()
+    directory = _lora_directory()
+    if not directory.is_dir():
+        raise ValueError(f"LoRA folder does not exist: {directory}")
+    paths: list[str] = []
+    scales: list[float] = []
+    for adapter in adapters:
+        candidate = (directory / adapter.name).resolve()
+        if candidate.parent != directory or not candidate.is_file():
+            raise ValueError(f"LoRA adapter not found: {adapter.name}")
+        paths.append(str(candidate))
+        scales.append(adapter.scale)
+    return tuple(paths), tuple(scales)
+
+
+class PromptOptimizationRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=8_000)
+    llm_url: str = Field(min_length=1, max_length=512)
+    model: str = Field(min_length=1, max_length=512)
+    system_prompt: str = Field(
+        default=DEFAULT_PROMPT_OPTIMIZER_SYSTEM_PROMPT,
+        min_length=1,
+        max_length=4_000,
+    )
+
+    @field_validator("llm_url")
+    @classmethod
+    def _validate_local_llm_url(cls, value: str) -> str:
+        return _validate_local_llm_endpoint(value)
+
+
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=24_000)
+
+
+class ChatAttachment(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    kind: Literal["text", "pdf", "image"]
+    excerpt: str = Field(min_length=1, max_length=24_000)
+    data_url: str | None = Field(default=None, max_length=12_000_000)
+
+    @field_validator("data_url")
+    @classmethod
+    def _validate_image_data_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not re.match(r"^data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+$", value):
+            raise ValueError("Image attachments must be local base64 image data.")
+        return value
+
+
+class ChatRequest(BaseModel):
+    messages: list[ChatMessage] = Field(min_length=1, max_length=30)
+    attachments: list[ChatAttachment] = Field(default_factory=list, max_length=5)
+    web_search: bool = False
+    llm_url: str = Field(min_length=1, max_length=512)
+    model: str = Field(min_length=1, max_length=512)
+    vision_llm_url: str | None = Field(default=None, max_length=512)
+    vision_model: str | None = Field(default=None, max_length=512)
+    system_prompt: str = Field(
+        default=DEFAULT_CHAT_SYSTEM_PROMPT,
+        min_length=1,
+        max_length=4_000,
+    )
+
+    @field_validator("llm_url")
+    @classmethod
+    def _validate_local_llm_url(cls, value: str) -> str:
+        return _validate_local_llm_endpoint(value)
+
+    @field_validator("vision_llm_url")
+    @classmethod
+    def _validate_local_vision_url(cls, value: str | None) -> str | None:
+        return _validate_local_llm_endpoint(value) if value else value
+
+
+class PdfExtractRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    data_base64: str = Field(min_length=1, max_length=12_000_000)
+
+
+class ChatAgentProfile(BaseModel):
+    id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=280)
+    webSearchDefault: bool = False
+    systemPrompt: str = Field(min_length=1, max_length=8_000)
+
+
+def _chat_agent_profiles() -> list[dict[str, str | bool]]:
+    """Load explicit local chat profiles; agent source files are never executed."""
+    profiles: list[dict[str, str | bool]] = []
+    if not CHAT_AGENTS_DIR.is_dir():
+        return profiles
+    for profile_path in sorted(CHAT_AGENTS_DIR.rglob("chat/profile.json")):
+        try:
+            profile = ChatAgentProfile.model_validate_json(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("Skipping unreadable chat profile %s: %s", profile_path, exc)
+            continue
+        profiles.append(profile.model_dump())
+    return profiles
+
+
+def _plain_html(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", value))).strip()
+
+
+def _decode_duckduckgo_url(value: str) -> str:
+    href = html.unescape(value).strip()
+    if href.startswith("//"):
+        href = f"https:{href}"
+    parsed = urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        return unquote(parse_qs(parsed.query).get("uddg", [href])[0])
+    return href
+
+
+def _web_search_query(query: str) -> tuple[str, dict[str, str], str]:
+    """Make relative-time questions reproducible for a search engine and the LLM."""
+    now = datetime.now(BERLIN_TIMEZONE)
+    lowered = query.casefold()
+    relative_terms = ("heute", "gestern", "aktuell", "neuest", "latest", "letzte", "today", "yesterday")
+    params: dict[str, str] = {}
+    search_query = query.strip()
+    mentions_today = "heute" in lowered or "today" in lowered
+    mentions_yesterday = "gestern" in lowered or "yesterday" in lowered
+    if mentions_today and mentions_yesterday:
+        search_query = (
+            f"{search_query} am {(now - timedelta(days=1)).strftime('%d.%m.%Y')} "
+            f"und {now.strftime('%d.%m.%Y')}"
+        )
+        params["df"] = "d"
+    elif mentions_yesterday:
+        search_query = f"{search_query} {(now - timedelta(days=1)).date().isoformat()}"
+        params["df"] = "d"
+    elif mentions_today or any(term in lowered for term in relative_terms):
+        search_query = f"{search_query} {now.date().isoformat()}"
+        params["df"] = "d"
+    return search_query, params, now.strftime("%Y-%m-%d %H:%M %Z")
+
+
+def _is_fifa_world_cup_query(query: str) -> bool:
+    lowered = query.casefold()
+    return "fifa" in lowered and any(term in lowered for term in (" wm", "weltmeisterschaft", "world cup"))
+
+
+async def _fifa_world_cup_scoreboard(query: str) -> list[dict[str, str]]:
+    """Add date-specific FIFA fixtures/results when a query explicitly asks for them."""
+    if not _is_fifa_world_cup_query(query):
+        return []
+    now = datetime.now(BERLIN_TIMEZONE)
+    dates = [now.date(), (now - timedelta(days=1)).date()]
+    results: list[dict[str, str]] = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            for date in dates:
+                response = await client.get(
+                    "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
+                    params={"dates": date.strftime("%Y%m%d")},
+                )
+                response.raise_for_status()
+                for event in response.json().get("events", []):
+                    competition = (event.get("competitions") or [{}])[0]
+                    competitors = competition.get("competitors") or []
+                    home = next((item for item in competitors if item.get("homeAway") == "home"), None)
+                    away = next((item for item in competitors if item.get("homeAway") == "away"), None)
+                    if not home or not away:
+                        continue
+                    home_name = home.get("team", {}).get("displayName")
+                    away_name = away.get("team", {}).get("displayName")
+                    status = event.get("status", {}).get("type", {}).get("description", "Status unbekannt")
+                    if not home_name or not away_name:
+                        continue
+                    starts = datetime.fromisoformat(event["date"].replace("Z", "+00:00")).astimezone(BERLIN_TIMEZONE)
+                    if status.casefold() == "full time":
+                        fixture = f"{home_name} {home.get('score', '?')}:{away.get('score', '?')} {away_name}"
+                    else:
+                        fixture = f"{home_name} – {away_name}"
+                    results.append(
+                        {
+                            "title": f"FIFA World Cup · {starts.strftime('%d.%m.%Y')}: {fixture}",
+                            "url": f"https://www.espn.com/soccer/scoreboard/_/league/fifa.world/date/{date.strftime('%Y%m%d')}",
+                            "snippet": f"ESPN-Spielplan, {starts.strftime('%H:%M %Z')}: {status}.",
+                            "provider": "ESPN Scoreboard",
+                        }
+                    )
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        log.info("FIFA scoreboard supplement unavailable: %s", exc)
+    return results[:2]
+
+
+async def _bing_news_fallback(query: str) -> list[dict[str, str]]:
+    """Use Bing News RSS only when DuckDuckGo's HTML endpoint rate-limits us."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=5.0),
+            follow_redirects=True,
+            headers={"User-Agent": "Bonsai-Image-Studio/1.0"},
+        ) as client:
+            response = await client.get(
+                "https://www.bing.com/news/search",
+                params={"q": query, "format": "rss", "setlang": "de-DE", "cc": "DE"},
+            )
+            response.raise_for_status()
+        root = ET.fromstring(response.content)
+    except (httpx.HTTPError, ET.ParseError) as exc:
+        log.info("Bing News fallback unavailable: %s", exc)
+        return []
+
+    results: list[dict[str, str]] = []
+    for item in root.findall(".//item"):
+        title = _plain_html(item.findtext("title") or "").lstrip(":–- ").strip()
+        url = (item.findtext("link") or "").strip()
+        parsed_url = urlparse(url)
+        if parsed_url.netloc.endswith("bing.com") and parsed_url.path.startswith("/news/apiclick"):
+            url = unquote(parse_qs(parsed_url.query).get("url", [url])[0])
+        snippet = _plain_html(item.findtext("description") or "")
+        if not title or not url.startswith(("https://", "http://")):
+            continue
+        results.append({"title": title[:240], "url": url[:1_500], "snippet": snippet[:500], "provider": "Bing News"})
+        if len(results) == 3:
+            break
+    return results
+
+
+async def _duckduckgo_search(query: str) -> tuple[list[dict[str, str]], str, str, str]:
+    """Return DuckDuckGo results, with an explicit news-RSS fallback on a DDG challenge."""
+    search_query, params, timestamp = _web_search_query(query)
+    params["q"] = search_query
+    scoreboard_sources = await _fifa_world_cup_scoreboard(query)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(12.0, connect=5.0),
+            follow_redirects=True,
+            headers={"User-Agent": "Bonsai-Image-Studio/1.0"},
+        ) as client:
+            response = await client.get("https://html.duckduckgo.com/html/", params=params)
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        log.info("DuckDuckGo search unavailable: %s", exc)
+        news_sources = await _bing_news_fallback(search_query)
+        provider = "ESPN Scoreboard + Bing News fallback (DuckDuckGo unavailable)" if scoreboard_sources else "Bing News fallback (DuckDuckGo unavailable)"
+        return (scoreboard_sources + news_sources)[:3], search_query, timestamp, provider
+
+    # DuckDuckGo answers bot/rate-limit challenges with HTTP 202 and an HTML
+    # page without result links. Treat that as an unavailable search, never as
+    # an empty factual result set.
+    if response.status_code != 200:
+        log.info("DuckDuckGo search returned HTTP %s", response.status_code)
+        news_sources = await _bing_news_fallback(search_query)
+        provider = "ESPN Scoreboard + Bing News fallback (DuckDuckGo unavailable)" if scoreboard_sources else "Bing News fallback (DuckDuckGo unavailable)"
+        return (scoreboard_sources + news_sources)[:3], search_query, timestamp, provider
+
+    results: list[dict[str, str]] = []
+    # DuckDuckGo's nested result divs vary frequently. Match result links in the
+    # complete document and look only forward for their associated snippet.
+    # This deliberately avoids a brittle "two closing divs" HTML regex.
+    title_pattern = re.compile(
+        r'<a[^>]+class="[^\"]*result__a[^\"]*"[^>]+href="([^\"]+)"[^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    for title_match in title_pattern.finditer(response.text):
+        nearby_html = response.text[title_match.end(): title_match.end() + 4_000]
+        snippet_match = re.search(
+            r'<(?:a|div)[^>]+class="[^\"]*result__snippet[^\"]*"[^>]*>(.*?)</(?:a|div)>',
+            nearby_html,
+            re.DOTALL,
+        )
+        title = _plain_html(title_match.group(2))
+        url = _decode_duckduckgo_url(title_match.group(1))
+        if not title or not url:
+            continue
+        results.append({"title": title[:240], "url": url[:1_500], "snippet": _plain_html(snippet_match.group(1))[:500] if snippet_match else "", "provider": "DuckDuckGo"})
+        if len(results) == 8:
+            break
+    results.sort(
+        key=lambda item: (
+            bool(re.search(r"\b\d{1,2}\s*:\s*\d{1,2}\b", f"{item['title']} {item['snippet']}")),
+            urlparse(item["url"]).hostname in {"www.zdf.de", "www.zdfheute.de", "www.sportschau.de", "www.tagesschau.de", "www.espn.com", "www.espn.co.uk"},
+        ),
+        reverse=True,
+    )
+    if results:
+        provider = "ESPN Scoreboard + DuckDuckGo" if scoreboard_sources else "DuckDuckGo"
+        return (scoreboard_sources + results)[:3], search_query, timestamp, provider
+    news_sources = await _bing_news_fallback(search_query)
+    provider = "ESPN Scoreboard + Bing News fallback (DuckDuckGo returned no results)" if scoreboard_sources else "Bing News fallback (DuckDuckGo returned no results)"
+    return (scoreboard_sources + news_sources)[:3], search_query, timestamp, provider
+
+
+def _ground_unambiguous_score(answer: str, question: str, sources: list[dict[str, str]]) -> str:
+    """Keep a tiny text model from changing one explicit, unanimous result score."""
+    if not any(term in question.casefold() for term in ("gespielt", "ergebnis", "score", "result")):
+        return answer
+    score_pattern = re.compile(r"\b\d{1,2}\s*:\s*\d{1,2}\b")
+    source_scores = {
+        re.sub(r"\s+", "", match.group(0))
+        for source in sources
+        for match in score_pattern.finditer(f"{source['title']} {source['snippet']}")
+    }
+    if len(source_scores) != 1:
+        return answer
+    grounded_score = next(iter(source_scores))
+    if score_pattern.search(answer):
+        return score_pattern.sub(grounded_score, answer)
+    return f"Nach den Suchquellen lautet das Ergebnis **{grounded_score}**.\n\n{answer}"
+
+
+def _attachment_context(attachments: list[ChatAttachment], *, vision_enabled: bool) -> str:
+    if not attachments:
+        return ""
+    parts = ["Attached local material:"]
+    for attachment in attachments:
+        if attachment.kind == "image":
+            if vision_enabled and attachment.data_url:
+                parts.append(
+                    f"[Image attachment: {attachment.name}]\n"
+                    "Analyze the actual attached image. Do not invent details that are not visible."
+                )
+                continue
+            parts.append(
+                f"[Image attachment: {attachment.name}]\n"
+                "No image pixels, OCR text, or visual description are available to this text-only model. "
+                "Do not infer or describe the image content."
+            )
+            continue
+        label = {"text": "Text", "pdf": "PDF", "image": "Image"}[attachment.kind]
+        parts.append(f"[{label}: {attachment.name}]\n{attachment.excerpt}")
+    return "\n\n".join(parts)
 
 
 @asynccontextmanager
@@ -179,6 +600,195 @@ async def get_backends(force_disable: bool = False) -> dict:
     )
 
 
+@app.get("/loras")
+async def get_loras() -> dict:
+    """List only local, selectable Flux2/Klein adapter files.
+
+    The frontend receives filenames rather than paths so a browser client cannot
+    point the renderer at arbitrary files on the Mac.
+    """
+    try:
+        directory = _lora_directory()
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if not directory.is_dir():
+        return {"directory": str(directory), "loras": []}
+    adapters = [
+        {"name": item.name, "size_bytes": item.stat().st_size}
+        for item in sorted(directory.glob("*.safetensors"), key=lambda path: path.name.lower())
+        if item.is_file()
+    ]
+    return {"directory": str(directory), "loras": adapters}
+
+
+@app.post("/optimize-prompt")
+async def optimize_prompt(request: PromptOptimizationRequest) -> dict:
+    """Ask an explicitly configured loopback OpenAI-compatible LLM for one prompt."""
+    body = {
+        "model": request.model,
+        "messages": [
+            {"role": "system", "content": request.system_prompt},
+            {"role": "user", "content": request.prompt},
+        ],
+        "temperature": 0.4,
+        "max_tokens": 128,
+        # Bonsai-27B supports this MLX-LM template option. Other compatible
+        # local servers may simply ignore it.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=5.0)) as client:
+            response = await client.post(f"{request.llm_url}/chat/completions", json=body)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Local LLM could not be reached: {exc}") from exc
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("error", response.text)
+        except ValueError:
+            detail = response.text
+        raise HTTPException(
+            status_code=502,
+            detail=f"Local LLM returned {response.status_code}: {detail}",
+        )
+    try:
+        payload = response.json()
+        optimized = payload["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Local LLM returned no usable prompt.") from exc
+    if not isinstance(optimized, str) or not optimized.strip():
+        raise HTTPException(status_code=502, detail="Local LLM returned an empty prompt.")
+    return {"prompt": optimized.strip()}
+
+
+@app.post("/extract-pdf")
+async def extract_pdf(request: PdfExtractRequest) -> dict:
+    """Extract a bounded, local text excerpt from a user-selected PDF."""
+    try:
+        raw = base64.b64decode(request.data_base64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="The PDF data is not valid base64.") from exc
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="PDF files are limited to 8 MB in chat.")
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        pages = reader.pages[:40]
+        text = "\n\n".join(page.extract_text() or "" for page in pages).strip()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="The PDF could not be read locally.") from exc
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail="No selectable text was found in this PDF. Scanned PDFs need OCR before Bonsai-27B can use them.",
+        )
+    return {"filename": request.filename, "pages": len(reader.pages), "text": text[:24_000]}
+
+
+@app.get("/chat/agents")
+async def get_chat_agents() -> dict:
+    """Expose curated local chat profiles to the Studio chat selector."""
+    return {"agents": _chat_agent_profiles()}
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest) -> dict:
+    """Run a local Bonsai LLM conversation with optional local and web context."""
+    messages = [{"role": "system", "content": request.system_prompt}]
+    messages.extend(message.model_dump() for message in request.messages[-20:])
+
+    sources: list[dict[str, str]] = []
+    search_provider = ""
+    image_attachments = [item for item in request.attachments if item.kind == "image" and item.data_url]
+    vision_enabled = bool(image_attachments and request.vision_llm_url and request.vision_model)
+    extra_context = _attachment_context(request.attachments, vision_enabled=vision_enabled)
+    if request.web_search:
+        latest_question = next(
+            (message.content for message in reversed(request.messages) if message.role == "user"),
+            "",
+        )
+        sources, search_query, timestamp, search_provider = await _duckduckgo_search(latest_question)
+        if sources:
+            web_context = (
+                f"WEB SEARCH RESULTS\nCurrent local time: {timestamp}\n"
+                f"Search query: {search_query}\n"
+                f"Search provider: {search_provider}\n"
+                "Use only these sources for factual claims and cite [1], [2] or [3]. "
+                "For dated sports fixtures/results, copy the date, teams, score and status exactly from the source title; "
+                "never add a team, score or match event that is absent from the sources.\n" + "\n".join(
+                    f"[{index}] {source['title']}\n{source['snippet']}\n{source['url']}"
+                    for index, source in enumerate(sources, start=1)
+                )
+            )
+            extra_context = "\n\n".join(part for part in (extra_context, web_context) if part)
+        else:
+            extra_context = "\n\n".join(part for part in (
+                extra_context,
+                f"WEB SEARCH RESULTS\nCurrent local time: {timestamp}\nSearch query: {search_query}\n"
+                f"Search provider: {search_provider}\nNo usable results were found. State this plainly; do not answer from memory.",
+            ) if part)
+    if extra_context:
+        for message in reversed(messages):
+            if message["role"] == "user":
+                message["content"] = f"{message['content']}\n\n{extra_context}"
+                break
+
+    endpoint = request.llm_url
+    model = request.model
+    if image_attachments:
+        if not vision_enabled:
+            raise HTTPException(status_code=422, detail="Bildanalyse benötigt einen lokal gestarteten Vision-Server und ein Vision-Modell in den Studio-Einstellungen.")
+        endpoint = request.vision_llm_url or request.llm_url
+        model = request.vision_model or request.model
+        for message in reversed(messages):
+            if message["role"] == "user":
+                text = message["content"]
+                message["content"] = [
+                    {"type": "text", "text": text},
+                    *[
+                        {"type": "image_url", "image_url": {"url": attachment.data_url}}
+                        for attachment in image_attachments
+                    ],
+                ]
+                break
+
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1_024,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as client:
+            response = await client.post(f"{endpoint}/chat/completions", json=body)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Local LLM could not be reached: {exc}") from exc
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("error", response.text)
+        except ValueError:
+            detail = response.text
+        raise HTTPException(status_code=502, detail=f"Local LLM returned {response.status_code}: {detail}")
+    try:
+        answer = response.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Local LLM returned no usable chat response.") from exc
+    if not isinstance(answer, str) or not answer.strip():
+        raise HTTPException(status_code=502, detail="Local LLM returned an empty chat response.")
+    latest_question = next(
+        (message.content for message in reversed(request.messages) if message.role == "user"),
+        "",
+    )
+    grounded_answer = _ground_unambiguous_score(answer.strip(), latest_question, sources)
+    source_links = ""
+    if sources:
+        provider_note = f"*Recherche: {search_provider}.*\n\n" if search_provider else ""
+        source_links = f"\n\n{provider_note}### Quellen\n" + "\n".join(
+            f"[{index}] [{source['title']}]({source['url']})"
+            for index, source in enumerate(sources, start=1)
+        )
+    return {"message": f"{grounded_answer}{source_links}", "sources": sources}
+
+
 @app.post(
     "/generate",
     response_class=Response,
@@ -202,13 +812,22 @@ async def generate(request: GenerateRequest) -> Response:
     target_backend: Backend = request.backend if request.backend is not None else pipeline.backend
     if target_backend not in BACKENDS:
         raise HTTPException(status_code=400, detail=f"Unknown backend {target_backend!r}.")
+    try:
+        lora_paths, lora_scales = _resolve_lora_adapters(request.lora_adapters)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async with AsyncExitStack() as stack:
         if not pipeline.is_remote:
             # Why: lock guards in-process MLX swap; remote arm has no resident model so concurrency is safe.
             await stack.enter_async_context(lock)
         try:
-            pipeline.ensure_backend(backend=target_backend, model_path=request.model_path)
+            pipeline.ensure_backend(
+                backend=target_backend,
+                model_path=request.model_path,
+                lora_paths=lora_paths,
+                lora_scales=lora_scales,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -242,7 +861,7 @@ async def generate(request: GenerateRequest) -> Response:
 class CompareRequest(BaseModel):
     prompt: str = Field(min_length=1)
     seed: int = DEFAULT_SEED
-    steps: int = Field(default=DEFAULT_STEPS, ge=1)
+    steps: int = Field(default=DEFAULT_STEPS, ge=2)
     guidance: float = Field(default=DEFAULT_GUIDANCE, ge=0.0)
     height: int = Field(default=DEFAULT_HEIGHT, ge=16)
     width: int = Field(default=DEFAULT_WIDTH, ge=16)

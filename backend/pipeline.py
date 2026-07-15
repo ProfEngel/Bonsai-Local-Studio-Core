@@ -241,6 +241,8 @@ def _build_model(
     backend: Backend,
     model_path: str | None,
     config: PipelineConfig,
+    lora_paths: tuple[str, ...] = (),
+    lora_scales: tuple[float, ...] = (),
 ) -> Flux2Klein:
     if backend in REMOTE_BACKENDS:
         raise ValueError(
@@ -256,6 +258,8 @@ def _build_model(
             evict_text_encoder=config.evict_text_encoder,
             lazy_components=config.lazy_components,
             bucketed_seq_len=config.bucketed_seq_len,
+            lora_paths=list(lora_paths) or None,
+            lora_scales=list(lora_scales) or None,
         )
     if backend == "bonsai-binary-mlx":
         return Flux2Klein(
@@ -266,6 +270,8 @@ def _build_model(
             evict_text_encoder=config.evict_text_encoder,
             lazy_components=config.lazy_components,
             bucketed_seq_len=config.bucketed_seq_len,
+            lora_paths=list(lora_paths) or None,
+            lora_scales=list(lora_scales) or None,
         )
     raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}.")
 
@@ -285,6 +291,8 @@ class FluxPipeline:
         self.config = config
         self._backend: Backend | None = None
         self._model_path: str | None = None
+        self._lora_paths: tuple[str, ...] = ()
+        self._lora_scales: tuple[float, ...] = ()
         self._model: Flux2Klein | None = None
         self.last_swap_seconds: float | None = None
         self.last_peak_memory_mb: float | None = None
@@ -299,9 +307,22 @@ class FluxPipeline:
     def model_path(self) -> str | None:
         return self._model_path
 
-    def _load(self, *, backend: Backend, model_path: str | None) -> None:
+    def _load(
+        self,
+        *,
+        backend: Backend,
+        model_path: str | None,
+        lora_paths: tuple[str, ...] = (),
+        lora_scales: tuple[float, ...] = (),
+    ) -> None:
         start = time.perf_counter()
-        self._model = _build_model(backend=backend, model_path=model_path, config=self.config)
+        self._model = _build_model(
+            backend=backend,
+            model_path=model_path,
+            config=self.config,
+            lora_paths=lora_paths,
+            lora_scales=lora_scales,
+        )
         if self.config.te_4bit:
             # Replace the freshly loaded bf16 TE with the pre-quantized 4-bit Qwen3
             # from the local model dir (or fall back to mlx-community HF if not
@@ -317,10 +338,12 @@ class FluxPipeline:
             mx.clear_cache()
         self._backend = backend
         self._model_path = model_path
+        self._lora_paths = lora_paths
+        self._lora_scales = lora_scales
         self.last_swap_seconds = time.perf_counter() - start
         log.info(
             "Loaded backend=%s model_path=%s evict_te=%s lazy=%s evict_tx=%s evict_vae=%s "
-            "max_seq=%d bucketed=%s te_4bit=%s in %.3fs",
+            "max_seq=%d bucketed=%s te_4bit=%s loras=%d in %.3fs",
             backend,
             model_path,
             self.config.evict_text_encoder,
@@ -330,24 +353,43 @@ class FluxPipeline:
             self.config.max_sequence_length,
             self.config.bucketed_seq_len,
             self.config.te_4bit,
+            len(lora_paths),
             self.last_swap_seconds,
         )
 
-    def ensure_backend(self, *, backend: Backend, model_path: str | None) -> None:
+    def ensure_backend(
+        self,
+        *,
+        backend: Backend,
+        model_path: str | None,
+        lora_paths: tuple[str, ...] = (),
+        lora_scales: tuple[float, ...] = (),
+    ) -> None:
         resolved = model_path if model_path is not None else _default_model_path_for(backend, self.config)
-        if backend == self._backend and resolved == self._model_path:
+        if (
+            backend == self._backend
+            and resolved == self._model_path
+            and lora_paths == self._lora_paths
+            and lora_scales == self._lora_scales
+        ):
             return
         log.info(
-            "Hot-swapping backend %s(%s) -> %s(%s)",
+            "Hot-swapping backend %s(%s) -> %s(%s), loras=%d",
             self._backend,
             self._model_path,
             backend,
             resolved,
+            len(lora_paths),
         )
         self._model = None
         gc.collect()
         mx.clear_cache()
-        self._load(backend=backend, model_path=resolved)
+        self._load(
+            backend=backend,
+            model_path=resolved,
+            lora_paths=lora_paths,
+            lora_scales=lora_scales,
+        )
 
     def generate_png(
         self,
@@ -461,13 +503,22 @@ class RemoteGpuPipeline:
     def model_path(self) -> str | None:
         return None
 
-    def ensure_backend(self, *, backend: Backend, model_path: str | None) -> None:
+    def ensure_backend(
+        self,
+        *,
+        backend: Backend,
+        model_path: str | None,
+        lora_paths: tuple[str, ...] = (),
+        lora_scales: tuple[float, ...] = (),
+    ) -> None:
         # Why: remote arm holds no in-process model, so "swap" is a label change.
         if backend not in REMOTE_BACKENDS:
             raise ValueError(
                 f"Server started in remote-GPU mode; backend {backend!r} is local-only. "
                 f"Restart with MFLUX_STUDIO_DEFAULT_BACKEND set to one of {LOCAL_BACKENDS}."
             )
+        if lora_paths or lora_scales:
+            raise ValueError("LoRA adapters are currently available only for the local MLX backend.")
         self._backend = backend
 
     def generate_png(

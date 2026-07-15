@@ -20,18 +20,14 @@ describe("validatePrompt", () => {
     expect(validatePrompt("   \n\t  ")).toEqual({ ok: false, reason: "empty" });
   });
 
-  it("rejects 5 representative profane prompts", () => {
-    // Each entry hits a different category from the bad-words default list.
-    // Phrasing is plausible image-prompt context to catch bypasses.
-    const bad = [
-      "a cartoon shit emoji",
-      "a fucking sunset over the lake",
-      "asshole wearing a tuxedo",
-      "bitch holding a bouquet",
-      "dickhead in a bonsai garden",
+  it("does not filter prompt content", () => {
+    const unrestricted = [
+      "a gruesome horror creature in a dungeon",
+      "an erotic fantasy book cover",
+      "an adult dark-fantasy character portrait",
     ];
-    for (const prompt of bad) {
-      expect(validatePrompt(prompt)).toEqual({ ok: false, reason: "moderation" });
+    for (const prompt of unrestricted) {
+      expect(validatePrompt(prompt)).toEqual({ ok: true });
     }
   });
 });

@@ -8,7 +8,6 @@ import {
   backendFor,
   type ModelFamily,
 } from "@/lib/backends";
-import { MODERATION_REJECT_MESSAGE, validatePrompt } from "@/lib/prompt-moderator";
 import { useBackends } from "@/lib/use-backends";
 import { COMPARE_PRESETS, DEFAULT_PRESET_ID } from "@/lib/compare-presets";
 import { DEFAULT_RESOLUTION_ID, RESOLUTIONS, resolutionById } from "@/lib/resolutions";
@@ -159,11 +158,14 @@ export function CompareClient() {
   // whenever the user's choices drift outside the supported set.
   useEffect(() => {
     if (!supportedFamilies.length) return;
-    setSelectedFamilies((prev) => {
-      const filtered = prev.filter((f) => supportedFamilies.includes(f));
-      if (filtered.length === 0) return [defaultFamily];
-      return filtered;
+    const frame = window.requestAnimationFrame(() => {
+      setSelectedFamilies((prev) => {
+        const filtered = prev.filter((f) => supportedFamilies.includes(f));
+        if (filtered.length === 0) return [defaultFamily];
+        return filtered;
+      });
     });
+    return () => window.cancelAnimationFrame(frame);
   }, [supportedFamilies, defaultFamily]);
   const effectiveSelectedBackends = useMemo(() => {
     // Preserve canonical family order for deterministic slot layout.
@@ -215,11 +217,6 @@ export function CompareClient() {
 
   const handleRun = useCallback(async () => {
     if (isRunning || prompt.trim().length === 0) return;
-    const verdict = validatePrompt(prompt);
-    if (!verdict.ok && verdict.reason === "moderation") {
-      setError(MODERATION_REJECT_MESSAGE);
-      return;
-    }
     setIsRunning(true);
     setError(null);
 

@@ -1,9 +1,12 @@
 .venv/
+node_modules/
+.next/
 .vscode/
 __pycache__/
 *.py[cod]
 *.png
 .DS_Store
+graphify-out/
 smoke/
 DerivedData/
 *.xcuserstate
