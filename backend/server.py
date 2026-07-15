@@ -10,6 +10,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1433,6 +1434,70 @@ def _agent_source_links(sources: list[dict[str, str]]) -> str:
     )
 
 
+def _clean_portfolio_visual_text(value: object, *, limit: int) -> str:
+    """Keep model-provided visual labels compact and harmless for the UI."""
+    return re.sub(r"\s+", " ", str(value)).strip()[:limit]
+
+
+def _extract_portfolio_visual(answer: str) -> tuple[str, dict[str, object] | None]:
+    """Parse a small declarative portfolio card; never execute model-supplied markup."""
+    match = re.search(r"<portfolio_visual>\s*(\{.*?\})\s*</portfolio_visual>", answer, flags=re.DOTALL | re.IGNORECASE)
+    if not match:
+        return answer, None
+    clean_answer = (answer[:match.start()] + answer[match.end():]).strip()
+    try:
+        raw = json.loads(match.group(1))
+    except (TypeError, ValueError):
+        return clean_answer, None
+    if not isinstance(raw, dict):
+        return clean_answer, None
+
+    kpis: list[dict[str, str]] = []
+    for item in raw.get("kpis", [])[:3] if isinstance(raw.get("kpis"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        label = _clean_portfolio_visual_text(item.get("label", ""), limit=48)
+        value = _clean_portfolio_visual_text(item.get("value", ""), limit=48)
+        if not label or not value:
+            continue
+        tone = str(item.get("tone", "neutral")).casefold()
+        kpis.append({
+            "label": label,
+            "value": value,
+            "change": _clean_portfolio_visual_text(item.get("change", ""), limit=32),
+            "tone": tone if tone in {"positive", "negative", "neutral"} else "neutral",
+            "note": _clean_portfolio_visual_text(item.get("note", ""), limit=96),
+        })
+
+    chart: dict[str, object] | None = None
+    raw_chart = raw.get("chart")
+    if isinstance(raw_chart, dict) and isinstance(raw_chart.get("items"), list):
+        items: list[dict[str, object]] = []
+        for item in raw_chart["items"][:6]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                value = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+            label = _clean_portfolio_visual_text(item.get("label", ""), limit=32)
+            if not label or not math.isfinite(value) or abs(value) > 1_000_000_000:
+                continue
+            items.append({
+                "label": label,
+                "value": round(value, 4),
+                "note": _clean_portfolio_visual_text(item.get("note", ""), limit=64),
+            })
+        if 2 <= len(items) <= 6:
+            chart = {
+                "title": _clean_portfolio_visual_text(raw_chart.get("title", "Portfolio-Treiber"), limit=72) or "Portfolio-Treiber",
+                "unit": _clean_portfolio_visual_text(raw_chart.get("unit", "%"), limit=16) or "%",
+                "items": items,
+            }
+    visual: dict[str, object] | None = {"kpis": kpis, "chart": chart} if kpis or chart else None
+    return clean_answer, visual
+
+
 async def _agent_workflow_events(request: ChatRequest, profile: ChatAgentProfile, profile_path: Path):
     """Run a bounded Goose draft loop with visible, high-level review milestones."""
     try:
@@ -1513,9 +1578,13 @@ async def _agent_workflow_events(request: ChatRequest, profile: ChatAgentProfile
                 response_instruction=request.system_prompt,
             )
 
-        final_message = f"*Stand: {timestamp}*\n\n{draft.strip()}{_agent_source_links(sources)}"
+        response_text, portfolio_visual = _extract_portfolio_visual(draft) if profile.id == "portfolio-analyst" else (draft, None)
+        final_message = f"*Stand: {timestamp}*\n\n{response_text.strip()}{_agent_source_links(sources)}"
         yield _sse_event("progress", {"step": 5, "total": 5, "label": "Antwort geprüft und fertig", "detail": "Maximal drei Entwurfszyklen eingehalten"})
-        yield _sse_event("result", {"message": final_message, "runner": "Goose-Harness · geprüfter Agentenworkflow"})
+        result: dict[str, object] = {"message": final_message, "runner": "Goose-Harness · geprüfter Agentenworkflow"}
+        if portfolio_visual:
+            result["portfolio_visual"] = portfolio_visual
+        yield _sse_event("result", result)
     except HTTPException as exc:
         yield _sse_event("error", {"detail": str(exc.detail)})
     except Exception:

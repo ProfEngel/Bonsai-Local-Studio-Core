@@ -20,6 +20,9 @@ type AttachmentKind = "text" | "pdf" | "image";
 type Attachment = { id: string; name: string; kind: AttachmentKind; excerpt: string; note?: string; previewDataUrl?: string; dataUrl?: string };
 type ChatAgentProfile = { id: string; name: string; description: string; webSearchDefault: boolean; streamProgress?: boolean; starterPrompt?: string | null; systemPrompt: string };
 type AgentProgress = { step: number; total: number; label: string; detail?: string };
+type PortfolioKpi = { label: string; value: string; change?: string; tone?: "positive" | "negative" | "neutral"; note?: string };
+type PortfolioChartItem = { label: string; value: number; note?: string };
+type PortfolioVisual = { kpis?: PortfolioKpi[]; chart?: { title: string; unit: string; items: PortfolioChartItem[] } | null };
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -27,6 +30,7 @@ type ChatMessage = {
   createdAt: string;
   attachments?: Attachment[];
   runner?: string;
+  portfolioVisual?: PortfolioVisual;
 };
 type Conversation = { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[] };
 
@@ -55,6 +59,26 @@ function createConversation(): Conversation {
 function parseError(payload: unknown, fallback: string) {
   if (payload && typeof payload === "object" && "detail" in payload && typeof payload.detail === "string") return payload.detail;
   return fallback;
+}
+
+function PortfolioVisualCard({ visual }: { visual: PortfolioVisual }) {
+  const kpis = Array.isArray(visual.kpis) ? visual.kpis.slice(0, 3).filter((item) => item?.label && item?.value) : [];
+  const chart = visual.chart && Array.isArray(visual.chart.items) ? visual.chart : null;
+  const items = chart?.items.slice(0, 6).filter((item) => typeof item?.value === "number" && Number.isFinite(item.value) && item.label) ?? [];
+  if (!kpis.length && items.length < 2) return null;
+  const min = Math.min(0, ...items.map((item) => item.value));
+  const max = Math.max(0, ...items.map((item) => item.value));
+  const span = Math.max(max - min, 1);
+  const plotStart = 118;
+  const plotWidth = 342;
+  const zeroX = plotStart + ((0 - min) / span) * plotWidth;
+  const chartHeight = Math.max(112, items.length * 30 + 20);
+  const number = new Intl.NumberFormat("de-DE", { maximumFractionDigits: 2 });
+
+  return <section aria-label="Portfolio-Kennzahlen" className="mt-4 border-t border-border pt-3">
+    {kpis.length ? <div className="grid gap-2 sm:grid-cols-3">{kpis.map((kpi, index) => <div key={`${kpi.label}-${index}`} className="rounded-xl border border-border bg-background/30 px-3 py-2"><p className="text-[10px] font-medium uppercase tracking-[0.08em] text-muted">{kpi.label}</p><p className="mt-1 text-base font-medium text-foreground">{kpi.value}</p>{kpi.change ? <p className={cn("mt-0.5 text-xs", kpi.tone === "negative" ? "text-danger" : "text-muted-strong")}>{kpi.tone === "positive" ? "▲ " : kpi.tone === "negative" ? "▼ " : ""}{kpi.change}</p> : null}{kpi.note ? <p className="mt-1 text-[11px] text-muted">{kpi.note}</p> : null}</div>)}</div> : null}
+    {items.length >= 2 && chart ? <figure className="mt-3"><figcaption className="mb-2 text-xs font-medium text-muted-strong">{chart.title}</figcaption><svg viewBox={`0 0 520 ${chartHeight}`} role="img" aria-label={`${chart.title}: ${items.map((item) => `${item.label} ${number.format(item.value)} ${chart.unit}`).join(", ")}`} className="h-auto w-full"><line x1={zeroX} x2={zeroX} y1="6" y2={chartHeight - 6} className="stroke-border-strong" strokeWidth="1" />{items.map((item, index) => { const y = 16 + index * 30; const width = Math.max(Math.abs(item.value) / span * plotWidth, 1); const x = item.value >= 0 ? zeroX : zeroX - width; return <g key={`${item.label}-${index}`}><text x="4" y={y + 12} className="fill-muted text-[11px]">{item.label}</text><rect x={x} y={y} width={width} height="16" rx="4" className={item.value < 0 ? "fill-danger" : "fill-cta-bg"} /><text x={item.value < 0 ? x - 6 : x + width + 6} y={y + 12} textAnchor={item.value < 0 ? "end" : "start"} className="fill-muted-strong text-[11px]">{number.format(item.value)} {chart.unit}</text></g>; })}</svg><p className="mt-1 text-[10px] text-muted">Balken zeigen die vom Agenten belegten Treiber; Vorzeichen und Quellen bitte im Text prüfen.</p></figure> : null}
+  </section>;
 }
 
 function isPdf(file: File) {
@@ -297,7 +321,7 @@ export function ChatClient() {
         agent_id: selectedAgent?.id,
         system_prompt: settings.chatSystemPrompt,
       };
-      let payload: { message?: string; runner?: string; detail?: string } | null;
+      let payload: { message?: string; runner?: string; detail?: string; portfolio_visual?: PortfolioVisual } | null;
       if (selectedAgent?.streamProgress) {
         setAgentProgress([]);
         const response = await fetch("/api/chat/stream", {
@@ -312,12 +336,12 @@ export function ChatClient() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
-        let finalPayload: { message?: string; runner?: string; detail?: string } | null = null;
+        let finalPayload: { message?: string; runner?: string; detail?: string; portfolio_visual?: PortfolioVisual } | null = null;
         const handleEvent = (raw: string) => {
           const event = raw.match(/^event:\s*(.+)$/m)?.[1]?.trim();
           const data = raw.match(/^data:\s*(.+)$/m)?.[1];
           if (!event || !data) return;
-          const eventPayload = JSON.parse(data) as AgentProgress & { message?: string; runner?: string; detail?: string };
+          const eventPayload = JSON.parse(data) as AgentProgress & { message?: string; runner?: string; detail?: string; portfolio_visual?: PortfolioVisual };
           if (event === "progress") {
             setAgentProgress((current) => [...current, { step: eventPayload.step, total: eventPayload.total, label: eventPayload.label, detail: eventPayload.detail }]);
           } else if (event === "result") {
@@ -342,12 +366,12 @@ export function ChatClient() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(requestBody),
         });
-        payload = await response.json().catch(() => null) as { message?: string; runner?: string; detail?: string } | null;
+        payload = await response.json().catch(() => null) as { message?: string; runner?: string; detail?: string; portfolio_visual?: PortfolioVisual } | null;
         if (!response.ok) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
       }
       if (!payload?.message) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
       const answer: ChatMessage = {
-        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), runner: payload.runner,
+        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), runner: payload.runner, portfolioVisual: payload.portfolio_visual,
       };
       setConversations((current) => current.map((conversation) => conversation.id === conversationId ? {
         ...conversation, updatedAt: answer.createdAt, messages: [...conversation.messages, answer],
@@ -397,6 +421,7 @@ export function ChatClient() {
                       pre: ({ children }) => <pre className="mb-2 overflow-x-auto rounded-lg bg-background/30 p-3 text-xs last:mb-0">{children}</pre>,
                     }}
                   >{message.content}</ReactMarkdown>
+                  {message.portfolioVisual ? <PortfolioVisualCard visual={message.portfolioVisual} /> : null}
                   {message.attachments?.length ? <div className="mt-3 flex flex-wrap gap-2 border-t border-current/15 pt-2 text-xs opacity-85">{message.attachments.map((attachment) => <div key={attachment.id} className="flex max-w-52 items-center gap-2 rounded-lg border border-current/15 px-2 py-1.5">{attachment.kind === "image" && attachment.previewDataUrl ? <NextImage src={attachment.previewDataUrl} alt={`Vorschau von ${attachment.name}`} width={40} height={40} unoptimized className="size-10 rounded object-cover" /> : attachment.kind === "image" ? <ImageIcon className="size-4" /> : <FileText className="size-4" />}<span className="min-w-0"><span className="block truncate">{attachment.name}</span><span className="block text-[10px]">{attachment.note ?? attachment.kind}</span></span></div>)}</div> : null}
                 </article>
               )) : <div className="grid h-full place-items-center text-center text-sm text-muted"><div><MessageCircle className="mx-auto mb-3 size-7" />Beginne eine lokale Unterhaltung mit Bonsai-27B.</div></div>}
