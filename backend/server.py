@@ -98,6 +98,12 @@ CHAT_AGENTS_DIR = Path(
         str(Path.home() / ".bonsai-studio" / "agents"),
     )
 ).expanduser()
+WEB_SEARCH_CONFIG_PATH = Path(
+    os.getenv(
+        "BONSAI_WEB_SEARCH_CONFIG",
+        str(Path.home() / ".config" / "bonsai-studio" / "web-search.json"),
+    )
+).expanduser()
 
 
 def _validate_local_llm_endpoint(value: str) -> str:
@@ -332,6 +338,11 @@ class ChatAgentProfile(BaseModel):
     systemPrompt: str = Field(min_length=1, max_length=8_000)
 
 
+class WebSearchConfigUpdate(BaseModel):
+    tavily_api_key: str | None = Field(default=None, max_length=1_024)
+    brave_api_key: str | None = Field(default=None, max_length=1_024)
+
+
 def _chat_agent_profiles() -> list[dict[str, str | bool]]:
     """Load explicit local chat profiles; agent source files are never executed."""
     profiles: list[dict[str, str | bool]] = []
@@ -402,8 +413,48 @@ def _search_topic(query: str) -> Literal["general", "news", "finance"]:
 
 
 def _configured_search_key(name: str) -> str:
-    """Read an optional provider key only on the local backend, never from chat JSON."""
-    return os.getenv(name, "").strip()
+    """Read a provider key locally; it is never returned to the browser."""
+    return _read_local_web_search_config().get(name, "") or os.getenv(name, "").strip()
+
+
+def _read_local_web_search_config() -> dict[str, str]:
+    """Read only the two supported keys from the private, local config file."""
+    try:
+        raw = json.loads(WEB_SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        name: value.strip()
+        for name, value in raw.items()
+        if name in {"TAVILY_API_KEY", "BRAVE_SEARCH_API_KEY"}
+        and isinstance(value, str)
+        and value.strip()
+    }
+
+
+def _write_local_web_search_config(updates: dict[str, str]) -> None:
+    """Persist keys with owner-only permissions, without ever logging their values."""
+    current = _read_local_web_search_config()
+    for name, value in updates.items():
+        cleaned = value.strip()
+        if not cleaned:
+            continue
+        if "\x00" in cleaned or "\n" in cleaned or "\r" in cleaned:
+            raise HTTPException(status_code=422, detail="Suchschlüssel dürfen keine Zeilenumbrüche enthalten.")
+        current[name] = cleaned
+    if not current:
+        return
+    try:
+        WEB_SEARCH_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(WEB_SEARCH_CONFIG_PATH.parent, 0o700)
+        temporary_path = WEB_SEARCH_CONFIG_PATH.with_name(f".{WEB_SEARCH_CONFIG_PATH.name}.{os.getpid()}.tmp")
+        temporary_path.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, WEB_SEARCH_CONFIG_PATH)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Lokale Suchkonfiguration konnte nicht gespeichert werden.") from exc
 
 
 def _is_fifa_world_cup_query(query: str) -> bool:
@@ -826,6 +877,26 @@ async def extract_pdf(request: PdfExtractRequest) -> dict:
 async def get_chat_agents() -> dict:
     """Expose curated local chat profiles to the Studio chat selector."""
     return {"agents": _chat_agent_profiles()}
+
+
+@app.get("/web-search/config")
+async def get_web_search_config() -> dict:
+    """Expose provider availability, never a provider key or its prefix."""
+    return {
+        "tavilyConfigured": bool(_configured_search_key("TAVILY_API_KEY")),
+        "braveConfigured": bool(_configured_search_key("BRAVE_SEARCH_API_KEY")),
+    }
+
+
+@app.put("/web-search/config")
+async def update_web_search_config(request: WebSearchConfigUpdate) -> dict:
+    """Store user-entered provider keys in an owner-only local file."""
+    updates = {
+        "TAVILY_API_KEY": request.tavily_api_key or "",
+        "BRAVE_SEARCH_API_KEY": request.brave_api_key or "",
+    }
+    _write_local_web_search_config(updates)
+    return await get_web_search_config()
 
 
 @app.post("/chat")

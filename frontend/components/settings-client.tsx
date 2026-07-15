@@ -16,10 +16,22 @@ import { Textarea } from "@/components/ui/textarea";
 export function SettingsClient() {
   const [settings, setSettings] = useState<StudioSettings>(DEFAULT_STUDIO_SETTINGS);
   const [saved, setSaved] = useState(false);
+  const [tavilyKey, setTavilyKey] = useState("");
+  const [braveKey, setBraveKey] = useState("");
+  const [searchStatus, setSearchStatus] = useState({ tavilyConfigured: false, braveConfigured: false });
+  const [searchSaving, setSearchSaving] = useState(false);
+  const [searchMessage, setSearchMessage] = useState("");
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => setSettings(readStudioSettings()));
     return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  useEffect(() => {
+    void fetch("/api/web-search/config", { cache: "no-store" })
+      .then(async (response) => response.ok ? response.json() : Promise.reject(new Error("status")))
+      .then((status) => setSearchStatus({ tavilyConfigured: Boolean(status.tavilyConfigured), braveConfigured: Boolean(status.braveConfigured) }))
+      .catch(() => setSearchMessage("Suchanbieter konnten nicht geprüft werden."));
   }, []);
 
   const update = <K extends keyof StudioSettings>(key: K, value: StudioSettings[K]) => {
@@ -35,6 +47,32 @@ export function SettingsClient() {
   const reset = () => {
     setSettings(DEFAULT_STUDIO_SETTINGS);
     setSaved(false);
+  };
+
+  const saveSearchKeys = async () => {
+    if (!tavilyKey.trim() && !braveKey.trim()) {
+      setSearchMessage("Gib mindestens einen Schlüssel ein.");
+      return;
+    }
+    setSearchSaving(true);
+    setSearchMessage("");
+    try {
+      const response = await fetch("/api/web-search/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tavily_api_key: tavilyKey, brave_api_key: braveKey }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "Speichern fehlgeschlagen.");
+      setSearchStatus({ tavilyConfigured: Boolean(body.tavilyConfigured), braveConfigured: Boolean(body.braveConfigured) });
+      setTavilyKey("");
+      setBraveKey("");
+      setSearchMessage("Lokal mit privaten Dateirechten gespeichert.");
+    } catch (error) {
+      setSearchMessage(error instanceof Error ? error.message : "Speichern fehlgeschlagen.");
+    } finally {
+      setSearchSaving(false);
+    }
   };
 
   return (
@@ -70,7 +108,7 @@ export function SettingsClient() {
           <div className="space-y-4 rounded-xl border border-border-strong bg-surface-strong p-4">
             <div>
               <p className="text-sm font-semibold">Vision-Modell für Bilder</p>
-              <p className="mt-1 text-xs text-muted">Text bleibt auf dem MLX-Server. Bildanhänge gehen nur an den lokalen GGUF-/llama.cpp-Vision-Server.</p>
+              <p className="mt-1 text-xs text-muted">Text und Bildanalyse gehen über die passenden lokalen Endpunkte des Bonsai‑2Bit-Vision-Servers.</p>
             </div>
             <label className="block space-y-2 text-sm font-medium">
               Vision endpoint
@@ -84,7 +122,7 @@ export function SettingsClient() {
           <div className="space-y-3 rounded-xl border border-border-strong bg-surface-strong p-4">
             <div>
               <p className="text-sm font-semibold">Webrecherche</p>
-              <p className="mt-1 text-xs text-muted">Wählt den Suchanbieter für den Chat. Schlüssel bleiben als lokale Umgebungsvariablen beim Studio-Backend und werden nicht im Browser gespeichert.</p>
+              <p className="mt-1 text-xs text-muted">Wählt den Suchanbieter für den Chat. Schlüssel werden nur lokal im Studio-Backend abgelegt und nie wieder an den Browser zurückgegeben.</p>
             </div>
             <label className="block space-y-2 text-sm font-medium">
               Suchanbieter
@@ -95,7 +133,12 @@ export function SettingsClient() {
                 <option value="fallback">Öffentliche Fallback-Suche</option>
               </select>
             </label>
-            <p className="text-xs text-muted"><code>TAVILY_API_KEY</code> aktiviert Tavily, <code>BRAVE_SEARCH_API_KEY</code> aktiviert Brave. Ohne Schlüssel bleibt die automatische Auswahl beim transparent gekennzeichneten Fallback.</p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block space-y-2 text-sm font-medium">Tavily API-Schlüssel <span className="text-xs font-normal text-muted">{searchStatus.tavilyConfigured ? "konfiguriert" : "noch nicht konfiguriert"}</span><Input type="password" autoComplete="new-password" value={tavilyKey} onChange={(event) => setTavilyKey(event.target.value)} placeholder="tvly-…" /></label>
+              <label className="block space-y-2 text-sm font-medium">Brave Search API-Schlüssel <span className="text-xs font-normal text-muted">{searchStatus.braveConfigured ? "konfiguriert" : "noch nicht konfiguriert"}</span><Input type="password" autoComplete="new-password" value={braveKey} onChange={(event) => setBraveKey(event.target.value)} placeholder="BSA…" /></label>
+            </div>
+            <div className="flex flex-wrap items-center gap-3"><Button type="button" variant="outline" size="sm" onClick={() => void saveSearchKeys()} disabled={searchSaving}>{searchSaving ? "Speichere …" : "Suchschlüssel lokal speichern"}</Button>{searchMessage ? <span className="text-xs text-muted">{searchMessage}</span> : null}</div>
+            <p className="text-xs text-muted">Automatisch nutzt Tavily, dann Brave, dann den transparent markierten öffentlichen Fallback. Bei Tavily oder Brave wird nur der aktuelle Suchprompt an den gewählten Anbieter gesendet.</p>
           </div>
           <label className="block space-y-2 text-sm font-medium">
             Optimizer instruction
