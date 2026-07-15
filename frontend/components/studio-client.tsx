@@ -23,7 +23,7 @@ import { SiteNav } from "@/components/site-nav";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { readStudioSettings } from "@/lib/studio-settings";
+import { readPersistentStudioSettings, readStudioSettings } from "@/lib/studio-settings";
 
 type Mode = "single" | "batch";
 const MODE_OPTIONS: { value: Mode; label: string }[] = [
@@ -153,6 +153,9 @@ export function StudioClient() {
       setPromptOptimizerEnabled(readStudioSettings().promptOptimizerEnabled);
     });
     let active = true;
+    void readPersistentStudioSettings().then((settings) => {
+      if (active && settings) setPromptOptimizerEnabled(settings.promptOptimizerEnabled);
+    });
     void fetch("/api/loras", { cache: "no-store" })
       .then(async (response) => {
         if (!response.ok) throw new Error(await parseError(response));
@@ -248,7 +251,7 @@ export function StudioClient() {
       const backendForRequest = resolvedBackend;
       let effectivePrompt = prompt;
       if (promptOptimizerEnabled) {
-        const optimizerSettings = readStudioSettings();
+        const optimizerSettings = await readPersistentStudioSettings() ?? readStudioSettings();
         if (!optimizerSettings.promptOptimizerEnabled) {
           setError("Enable and save the prompt optimizer in Studio settings first.");
           setIsLoading(false);

@@ -117,6 +117,12 @@ WEB_SEARCH_CONFIG_PATH = Path(
         str(Path.home() / ".config" / "bonsai-studio" / "web-search.json"),
     )
 ).expanduser()
+STUDIO_SETTINGS_CONFIG_PATH = Path(
+    os.getenv(
+        "BONSAI_STUDIO_SETTINGS_CONFIG",
+        str(Path.home() / ".config" / "bonsai-studio" / "settings.json"),
+    )
+).expanduser()
 
 
 def _validate_local_llm_endpoint(value: str) -> str:
@@ -375,6 +381,24 @@ class ChatAgentProfile(BaseModel):
 class WebSearchConfigUpdate(BaseModel):
     tavily_api_key: str | None = Field(default=None, max_length=1_024)
     brave_api_key: str | None = Field(default=None, max_length=1_024)
+
+
+class PersistentStudioSettings(BaseModel):
+    """Non-secret Studio preferences stored outside the updatable checkout."""
+
+    promptOptimizerEnabled: bool
+    llmUrl: str = Field(min_length=1, max_length=512)
+    model: str = Field(min_length=1, max_length=512)
+    visionLlmUrl: str = Field(min_length=1, max_length=512)
+    visionModel: str = Field(min_length=1, max_length=512)
+    webSearchProvider: Literal["auto", "tavily", "brave", "fallback"]
+    chatSystemPrompt: str = Field(min_length=1, max_length=4_000)
+    systemPrompt: str = Field(min_length=1, max_length=4_000)
+
+    @field_validator("llmUrl", "visionLlmUrl")
+    @classmethod
+    def _validate_local_endpoint(cls, value: str) -> str:
+        return _validate_local_llm_endpoint(value)
 
 
 def _chat_agent_profiles() -> list[dict[str, str | bool]]:
@@ -685,6 +709,32 @@ def _write_local_web_search_config(updates: dict[str, str]) -> None:
         os.replace(temporary_path, WEB_SEARCH_CONFIG_PATH)
     except OSError as exc:
         raise HTTPException(status_code=500, detail="Lokale Suchkonfiguration konnte nicht gespeichert werden.") from exc
+
+
+def _read_persistent_studio_settings() -> dict[str, object] | None:
+    """Read non-secret preferences from the update-independent local config."""
+    try:
+        raw = json.loads(STUDIO_SETTINGS_CONFIG_PATH.read_text(encoding="utf-8"))
+        return PersistentStudioSettings.model_validate(raw).model_dump()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_persistent_studio_settings(settings: PersistentStudioSettings) -> dict[str, object]:
+    """Atomically persist preferences with owner-only access."""
+    payload = settings.model_dump()
+    try:
+        STUDIO_SETTINGS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(STUDIO_SETTINGS_CONFIG_PATH.parent, 0o700)
+        temporary_path = STUDIO_SETTINGS_CONFIG_PATH.with_name(
+            f".{STUDIO_SETTINGS_CONFIG_PATH.name}.{os.getpid()}.tmp"
+        )
+        temporary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, STUDIO_SETTINGS_CONFIG_PATH)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Lokale Studio-Einstellungen konnten nicht gespeichert werden.") from exc
+    return payload
 
 
 def _is_fifa_world_cup_query(query: str) -> bool:
@@ -1127,6 +1177,18 @@ async def update_web_search_config(request: WebSearchConfigUpdate) -> dict:
     }
     _write_local_web_search_config(updates)
     return await get_web_search_config()
+
+
+@app.get("/studio-settings")
+async def get_studio_settings() -> dict:
+    """Return persisted non-secret preferences, never web-search credentials."""
+    return {"settings": _read_persistent_studio_settings()}
+
+
+@app.put("/studio-settings")
+async def update_studio_settings(request: PersistentStudioSettings) -> dict:
+    """Persist non-secret Studio preferences outside the checkout."""
+    return {"settings": _write_persistent_studio_settings(request)}
 
 
 @app.post("/chat")

@@ -8,7 +8,7 @@ import { SiteNav } from "@/components/site-nav";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { readStudioSettings } from "@/lib/studio-settings";
+import { readPersistentStudioSettings, readStudioSettings } from "@/lib/studio-settings";
 
 const CHAT_HISTORY_KEY = "bonsai-chat-history-v1";
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -149,6 +149,7 @@ export function ChatClient() {
   }, []);
 
   useEffect(() => {
+    void readPersistentStudioSettings();
     void fetch("/api/chat", { cache: "no-store" })
       .then((response) => response.ok ? response.json() : { agents: [] })
       .then((payload: { agents?: ChatAgentProfile[] }) => setAgentProfiles(Array.isArray(payload.agents) ? payload.agents : []))
@@ -282,7 +283,7 @@ export function ChatClient() {
     setIsSending(true);
 
     try {
-      const settings = readStudioSettings();
+      const settings = await readPersistentStudioSettings() ?? readStudioSettings();
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },

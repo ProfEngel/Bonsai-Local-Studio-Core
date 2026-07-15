@@ -23,8 +23,32 @@ export function SettingsClient() {
   const [searchMessage, setSearchMessage] = useState("");
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(() => setSettings(readStudioSettings()));
-    return () => window.cancelAnimationFrame(frame);
+    let active = true;
+    const browserSettings = readStudioSettings();
+    void fetch("/api/studio-settings", { cache: "no-store" })
+      .then(async (response) => response.ok ? response.json() : Promise.reject(new Error("status")))
+      .then(async (payload: { settings?: StudioSettings | null }) => {
+        if (!active) return;
+        if (payload.settings) {
+          writeStudioSettings(payload.settings);
+          setSettings(payload.settings);
+          return;
+        }
+        // One-time migration of earlier browser-only settings. Search keys stay
+        // in their separate private file and are never read into the browser.
+        const migration = await fetch("/api/studio-settings", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(browserSettings),
+        });
+        const migrated = await migration.json() as { settings?: StudioSettings };
+        if (active && migration.ok && migrated.settings) {
+          writeStudioSettings(migrated.settings);
+          setSettings(migrated.settings);
+        }
+      })
+      .catch(() => active && setSettings(browserSettings));
+    return () => { active = false; };
   }, []);
 
   useEffect(() => {
@@ -39,9 +63,23 @@ export function SettingsClient() {
     setSettings((current) => ({ ...current, [key]: value }));
   };
 
-  const save = () => {
+  const save = async () => {
     writeStudioSettings(settings);
-    setSaved(true);
+    try {
+      const response = await fetch("/api/studio-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+      const payload = await response.json() as { settings?: StudioSettings; detail?: string };
+      if (!response.ok || !payload.settings) throw new Error(payload.detail || "Speichern fehlgeschlagen.");
+      writeStudioSettings(payload.settings);
+      setSettings(payload.settings);
+      setSaved(true);
+      if (tavilyKey.trim() || braveKey.trim()) await saveSearchKeys();
+    } catch (error) {
+      setSearchMessage(error instanceof Error ? error.message : "Studio-Einstellungen konnten nicht gespeichert werden.");
+    }
   };
 
   const reset = () => {
@@ -150,9 +188,9 @@ export function SettingsClient() {
             <Textarea className="min-h-[160px] rounded-xl text-sm leading-6" value={settings.systemPrompt} onChange={(event) => update("systemPrompt", event.target.value)} />
           </label>
           <div className="flex flex-wrap gap-2 pt-1">
-            <Button type="button" onClick={save}><Check className="size-4" />Save settings</Button>
+            <Button type="button" onClick={() => void save()}><Check className="size-4" />Alles lokal speichern</Button>
             <Button type="button" variant="outline" onClick={reset}><RotateCcw className="size-4" />Reset</Button>
-            {saved ? <span className="self-center text-xs text-muted">Saved locally in this browser.</span> : null}
+            {saved ? <span className="self-center text-xs text-muted">Updatefest lokal gespeichert.</span> : null}
           </div>
         </section>
       </div>

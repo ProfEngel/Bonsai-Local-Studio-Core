@@ -39,3 +39,29 @@ export function readStudioSettings(): StudioSettings {
 export function writeStudioSettings(settings: StudioSettings) {
   window.localStorage.setItem(STUDIO_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
 }
+
+export async function readPersistentStudioSettings(): Promise<StudioSettings | null> {
+  try {
+    const response = await fetch("/api/studio-settings", { cache: "no-store" });
+    const payload = await response.json() as { settings?: StudioSettings | null };
+    if (!response.ok) return null;
+    if (payload.settings) {
+      writeStudioSettings(payload.settings);
+      return payload.settings;
+    }
+    // First use after an update: promote the existing browser settings to the
+    // durable local config automatically, without ever including search keys.
+    const browserSettings = readStudioSettings();
+    const migration = await fetch("/api/studio-settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(browserSettings),
+    });
+    const migrated = await migration.json() as { settings?: StudioSettings };
+    if (!migration.ok || !migrated.settings) return null;
+    writeStudioSettings(migrated.settings);
+    return migrated.settings;
+  } catch {
+    return null;
+  }
+}
