@@ -81,6 +81,22 @@ export function SettingsClient() {
               <Input value={settings.visionModel} onChange={(event) => update("visionModel", event.target.value)} />
             </label>
           </div>
+          <div className="space-y-3 rounded-xl border border-border-strong bg-surface-strong p-4">
+            <div>
+              <p className="text-sm font-semibold">Webrecherche</p>
+              <p className="mt-1 text-xs text-muted">Wählt den Suchanbieter für den Chat. Schlüssel bleiben als lokale Umgebungsvariablen beim Studio-Backend und werden nicht im Browser gespeichert.</p>
+            </div>
+            <label className="block space-y-2 text-sm font-medium">
+              Suchanbieter
+              <select value={settings.webSearchProvider} onChange={(event) => update("webSearchProvider", event.target.value as StudioSettings["webSearchProvider"])} className="flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
+                <option value="auto">Automatisch (Tavily → Brave → Fallback)</option>
+                <option value="tavily">Tavily</option>
+                <option value="brave">Brave Search</option>
+                <option value="fallback">Öffentliche Fallback-Suche</option>
+              </select>
+            </label>
+            <p className="text-xs text-muted"><code>TAVILY_API_KEY</code> aktiviert Tavily, <code>BRAVE_SEARCH_API_KEY</code> aktiviert Brave. Ohne Schlüssel bleibt die automatische Auswahl beim transparent gekennzeichneten Fallback.</p>
+          </div>
           <label className="block space-y-2 text-sm font-medium">
             Optimizer instruction
             <Textarea className="min-h-[160px] rounded-xl text-sm leading-6" value={settings.systemPrompt} onChange={(event) => update("systemPrompt", event.target.value)} />

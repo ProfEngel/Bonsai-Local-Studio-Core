@@ -289,6 +289,7 @@ export function ChatClient() {
           messages: history.map(({ role, content }) => ({ role, content })),
           attachments,
           web_search: webSearch,
+          web_search_provider: settings.webSearchProvider,
           llm_url: settings.llmUrl,
           model: settings.model,
           vision_llm_url: settings.visionLlmUrl,
@@ -366,11 +367,11 @@ export function ChatClient() {
                 <div className="flex flex-wrap items-center gap-3">
                   <input ref={fileInputRef} aria-label="Dateien anhängen" onChange={(event) => { const files = event.currentTarget.files ? Array.from(event.currentTarget.files) : []; event.currentTarget.value = ""; if (files.length) void addFiles(files); }} type="file" multiple accept="image/*,.pdf,text/plain,.txt,.md,.csv,.json,.html,.htm,.xml,.yaml,.yml,.py,.ts,.tsx,.js,.jsx,.css,.sql,.log" className="hidden" />
                   <Button type="button" variant="outline" size="sm" onClick={() => fileInputRef.current?.click()} disabled={isSending || isReadingFiles}><Paperclip className="size-3.5" />{isReadingFiles ? "Lese Anhang …" : "Anhang"}</Button>
-                  <label className="flex cursor-pointer items-center gap-2 text-xs text-muted"><input type="checkbox" checked={webSearch} onChange={(event) => setWebSearch(event.target.checked)} disabled={isSending} className="size-4 accent-[var(--accent)]" /><Search className="size-3.5" />Websuche einbeziehen</label>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-muted"><input type="checkbox" checked={webSearch} onChange={(event) => setWebSearch(event.target.checked)} disabled={isSending} className="size-4 accent-[var(--accent)]" /><Search className="size-3.5" />Websuche ({readStudioSettings().webSearchProvider === "auto" ? "Auto" : readStudioSettings().webSearchProvider})</label>
                 </div>
                 <Button type="submit" disabled={isSending || isReadingFiles || (!draft.trim() && attachments.length === 0)}><Send className="size-4" />Senden</Button>
               </div>
-              <p className="mt-3 text-[10px] text-muted">Enter sendet, Umschalt-Enter erstellt eine neue Zeile. Text, PDFs und Bilder bleiben lokal. Bei aktivierter Suche wird nur die aktuelle Frage gesendet: zuerst an DuckDuckGo, bei dessen Sperre an Bing News als Fallback. Für FIFA-Spielanfragen ergänzt der öffentliche ESPN-Spielplan aktuelle Paarungen und Ergebnisse. Quellen erscheinen als Links in der Antwort.</p>
+              <p className="mt-3 text-[10px] text-muted">Enter sendet, Umschalt-Enter erstellt eine neue Zeile. Text, PDFs und Bilder bleiben lokal. Bei aktivierter Suche wird nur die aktuelle Frage an den in Settings gewählten Anbieter gesendet; Quellen und der tatsächlich verwendete Weg erscheinen in der Antwort. Für FIFA-Spielanfragen ergänzt der öffentliche ESPN-Spielplan aktuelle Paarungen und Ergebnisse.</p>
             </form>
           </section>
         </div>

@@ -6,6 +6,7 @@ export type StudioSettings = {
   model: string;
   visionLlmUrl: string;
   visionModel: string;
+  webSearchProvider: "auto" | "tavily" | "brave" | "fallback";
   systemPrompt: string;
 };
 
@@ -15,6 +16,7 @@ export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   model: "prism-ml/Bonsai-27B-mlx-1bit",
   visionLlmUrl: "http://127.0.0.1:8080/v1",
   visionModel: "Bonsai-27B-Q1_0.gguf",
+  webSearchProvider: "auto",
   systemPrompt:
     "You improve prompts for a Flux2 Klein image model. Return exactly one English image prompt, one sentence, at most 60 words, with no repetition or explanation. Preserve the user's subject and intent; add useful visual details such as composition, lighting, materials and style.",
 };

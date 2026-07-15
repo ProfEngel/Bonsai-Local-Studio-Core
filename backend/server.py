@@ -297,6 +297,7 @@ class ChatRequest(BaseModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=30)
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=5)
     web_search: bool = False
+    web_search_provider: Literal["auto", "tavily", "brave", "fallback"] = "auto"
     llm_url: str = Field(min_length=1, max_length=512)
     model: str = Field(min_length=1, max_length=512)
     vision_llm_url: str | None = Field(default=None, max_length=512)
@@ -384,6 +385,27 @@ def _web_search_query(query: str) -> tuple[str, dict[str, str], str]:
     return search_query, params, now.strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _search_topic(query: str) -> Literal["general", "news", "finance"]:
+    """Map a natural-language question to the documented Tavily search topics."""
+    lowered = query.casefold()
+    if any(term in lowered for term in (
+        "aktie", "aktien", "etf", "portfolio", "börse", "boerse", "kurs", "dividende",
+        "crypto", "krypto", "bitcoin", "ethereum", "finanz", "wirtschaft", "earnings",
+    )):
+        return "finance"
+    if any(term in lowered for term in (
+        "news", "nachricht", "politik", "bundestag", "regierung", "wahl", "sport",
+        "fussball", "fußball", "spiel", "wm", "wetter", "heute", "gestern", "aktuell",
+    )):
+        return "news"
+    return "general"
+
+
+def _configured_search_key(name: str) -> str:
+    """Read an optional provider key only on the local backend, never from chat JSON."""
+    return os.getenv(name, "").strip()
+
+
 def _is_fifa_world_cup_query(query: str) -> bool:
     lowered = query.casefold()
     return "fifa" in lowered and any(term in lowered for term in (" wm", "weltmeisterschaft", "world cup"))
@@ -468,6 +490,82 @@ async def _bing_news_fallback(query: str) -> list[dict[str, str]]:
     return results
 
 
+async def _tavily_search(query: str, api_key: str) -> list[dict[str, str]]:
+    """Use Tavily's supported API rather than scraping a public search page."""
+    search_query, _, _ = _web_search_query(query)
+    body = {
+        "query": search_query,
+        "topic": _search_topic(query),
+        "search_depth": "basic",
+        "max_results": 5,
+        "include_answer": False,
+        "include_raw_content": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            response = await client.post(
+                "https://api.tavily.com/search",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=body,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        log.info("Tavily search unavailable: %s", exc)
+        return []
+
+    results: list[dict[str, str]] = []
+    for item in payload.get("results", []):
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("content") or "").strip()
+        published = str(item.get("published_date") or "").strip()
+        if not title or not url.startswith(("https://", "http://")):
+            continue
+        if published:
+            snippet = f"{published} · {snippet}"
+        results.append({"title": title[:240], "url": url[:1_500], "snippet": snippet[:800], "provider": "Tavily"})
+        if len(results) == 5:
+            break
+    return results
+
+
+async def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
+    """Use Brave's supported news/web API with German locale and freshness hints."""
+    search_query, _, _ = _web_search_query(query)
+    topic = _search_topic(query)
+    is_news = topic in {"news", "finance"}
+    params = {"q": search_query, "count": "5", "country": "DE", "search_lang": "de", "spellcheck": "1"}
+    if any(term in query.casefold() for term in ("heute", "gestern", "aktuell", "neueste", "neues", "today", "yesterday")):
+        params["freshness"] = "pd"
+    endpoint = "https://api.search.brave.com/res/v1/news/search" if is_news else "https://api.search.brave.com/res/v1/web/search"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+            response = await client.get(
+                endpoint,
+                headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        log.info("Brave search unavailable: %s", exc)
+        return []
+
+    raw_results = payload.get("results", []) if is_news else payload.get("web", {}).get("results", [])
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        title = str(item.get("title") or "").strip()
+        url = str(item.get("url") or "").strip()
+        snippet = str(item.get("description") or item.get("page_age") or "").strip()
+        if not title or not url.startswith(("https://", "http://")):
+            continue
+        results.append({"title": title[:240], "url": url[:1_500], "snippet": snippet[:800], "provider": "Brave Search"})
+        if len(results) == 5:
+            break
+    return results
+
+
 async def _duckduckgo_search(query: str) -> tuple[list[dict[str, str]], str, str, str]:
     """Return DuckDuckGo results, with an explicit news-RSS fallback on a DDG challenge."""
     search_query, params, timestamp = _web_search_query(query)
@@ -531,6 +629,47 @@ async def _duckduckgo_search(query: str) -> tuple[list[dict[str, str]], str, str
     news_sources = await _bing_news_fallback(search_query)
     provider = "ESPN Scoreboard + Bing News fallback (DuckDuckGo returned no results)" if scoreboard_sources else "Bing News fallback (DuckDuckGo returned no results)"
     return (scoreboard_sources + news_sources)[:3], search_query, timestamp, provider
+
+
+async def _web_search(query: str, provider_choice: str) -> tuple[list[dict[str, str]], str, str, str]:
+    """Choose a supported provider, keeping the legacy public search only as opt-in fallback."""
+    search_query, _, timestamp = _web_search_query(query)
+    scoreboard_sources = await _fifa_world_cup_scoreboard(query)
+    tavily_key = _configured_search_key("TAVILY_API_KEY")
+    brave_key = _configured_search_key("BRAVE_SEARCH_API_KEY")
+
+    choices = {
+        "auto": (["tavily", "brave", "fallback"], "Automatisch"),
+        "tavily": (["tavily"], "Tavily"),
+        "brave": (["brave"], "Brave Search"),
+        "fallback": (["fallback"], "Öffentliche Fallback-Suche"),
+    }
+    selected, label = choices.get(provider_choice, choices["auto"])
+    for provider in selected:
+        if provider == "tavily":
+            if not tavily_key:
+                if provider_choice == "tavily":
+                    raise HTTPException(status_code=422, detail="Tavily ist ausgewählt, aber TAVILY_API_KEY ist im Studio-Start nicht gesetzt.")
+                continue
+            results = await _tavily_search(query, tavily_key)
+            if results:
+                return (scoreboard_sources + results)[:5], search_query, timestamp, "ESPN Scoreboard + Tavily" if scoreboard_sources else "Tavily"
+            if provider_choice == "tavily":
+                return scoreboard_sources, search_query, timestamp, "Tavily lieferte keine verwertbaren Treffer"
+        elif provider == "brave":
+            if not brave_key:
+                if provider_choice == "brave":
+                    raise HTTPException(status_code=422, detail="Brave Search ist ausgewählt, aber BRAVE_SEARCH_API_KEY ist im Studio-Start nicht gesetzt.")
+                continue
+            results = await _brave_search(query, brave_key)
+            if results:
+                return (scoreboard_sources + results)[:5], search_query, timestamp, "ESPN Scoreboard + Brave Search" if scoreboard_sources else "Brave Search"
+            if provider_choice == "brave":
+                return scoreboard_sources, search_query, timestamp, "Brave Search lieferte keine verwertbaren Treffer"
+        else:
+            results, _, _, used_provider = await _duckduckgo_search(query)
+            return results, search_query, timestamp, used_provider
+    return scoreboard_sources, search_query, timestamp, f"{label}: kein konfigurierter Suchanbieter"
 
 
 def _ground_unambiguous_score(answer: str, question: str, sources: list[dict[str, str]]) -> str:
@@ -705,13 +844,16 @@ async def chat(request: ChatRequest) -> dict:
             (message.content for message in reversed(request.messages) if message.role == "user"),
             "",
         )
-        sources, search_query, timestamp, search_provider = await _duckduckgo_search(latest_question)
+        sources, search_query, timestamp, search_provider = await _web_search(
+            latest_question,
+            request.web_search_provider,
+        )
         if sources:
             web_context = (
                 f"WEB SEARCH RESULTS\nCurrent local time: {timestamp}\n"
                 f"Search query: {search_query}\n"
                 f"Search provider: {search_provider}\n"
-                "Use only these sources for factual claims and cite [1], [2] or [3]. "
+                "Use only these sources for factual claims and cite their matching source number. "
                 "For dated sports fixtures/results, copy the date, teams, score and status exactly from the source title; "
                 "never add a team, score or match event that is absent from the sources.\n" + "\n".join(
                     f"[{index}] {source['title']}\n{source['snippet']}\n{source['url']}"
