@@ -93,6 +93,12 @@ DEFAULT_CHAT_SYSTEM_PROMPT = (
     "wenn eine lokale Vision-Auswertung als Kontext bereitgestellt wurde."
 )
 
+# The 2-bit Bonsai server is configured for 128K tokens. Keep chat history
+# below roughly 90K input tokens so system rules, attachments, web results and
+# a 4K response still fit safely. Character counting is deliberately
+# conservative and avoids loading a second tokenizer into the image backend.
+MAX_CHAT_CONTEXT_CHARS = 360_000
+
 BERLIN_TIMEZONE = ZoneInfo("Europe/Berlin")
 CHAT_AGENTS_DIR = Path(
     os.getenv(
@@ -290,6 +296,26 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1, max_length=24_000)
 
 
+def _bounded_chat_history(messages: list[ChatMessage]) -> list[dict[str, str]]:
+    """Keep the newest usable history inside the configured long-context budget."""
+    selected: list[dict[str, str]] = []
+    used = 0
+    for message in reversed(messages):
+        content = message.content
+        remaining = MAX_CHAT_CONTEXT_CHARS - used
+        if remaining <= 0:
+            break
+        if len(content) > remaining:
+            marker = "[Früherer Teil dieser Nachricht wurde für das Kontextfenster ausgelassen.]\n"
+            content = marker + content[-max(0, remaining - len(marker)):]
+        selected.append({"role": message.role, "content": content})
+        used += len(content)
+        if used >= MAX_CHAT_CONTEXT_CHARS:
+            break
+    selected.reverse()
+    return selected
+
+
 class ChatAttachment(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     kind: Literal["text", "pdf", "image"]
@@ -307,7 +333,7 @@ class ChatAttachment(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(min_length=1, max_length=30)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=160)
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=5)
     web_search: bool = False
     web_search_provider: Literal["auto", "tavily", "brave", "fallback"] = "auto"
@@ -1107,7 +1133,7 @@ async def update_web_search_config(request: WebSearchConfigUpdate) -> dict:
 async def chat(request: ChatRequest) -> dict:
     """Run a local Bonsai LLM conversation with optional local and web context."""
     messages = [{"role": "system", "content": request.system_prompt}]
-    messages.extend(message.model_dump() for message in request.messages[-20:])
+    messages.extend(_bounded_chat_history(request.messages))
 
     sources: list[dict[str, str]] = []
     search_provider = ""
