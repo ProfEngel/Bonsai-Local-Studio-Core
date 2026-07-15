@@ -662,9 +662,66 @@ def _search_topic(query: str) -> Literal["general", "news", "finance"]:
     if any(term in lowered for term in (
         "news", "nachricht", "politik", "bundestag", "regierung", "wahl", "sport",
         "fussball", "fußball", "spiel", "wm", "wetter", "heute", "gestern", "aktuell",
+        "neuigkeit", "neuigkeiten", "neues", "trend", "trends", "entwicklungen", "passiert",
     )):
         return "news"
     return "general"
+
+
+def _is_current_search(query: str) -> bool:
+    """Detect whether recency is more important than broad background context."""
+    lowered = query.casefold()
+    return any(term in lowered for term in (
+        "heute", "gestern", "aktuell", "neueste", "neuesten", "neue nachrichten",
+        "neuigkeiten", "was gibt es neues", "was gibt's neues", "entwicklungen", "trends",
+        "today", "yesterday", "latest", "breaking news",
+    ))
+
+
+def _merge_sources(*groups: list[dict[str, str]], limit: int = 3) -> list[dict[str, str]]:
+    """Keep a short, diverse and query-relevant source set across search engines."""
+    query_terms: set[str] = set()
+    for group in groups:
+        for source in group:
+            query = source.get("query", "")
+            if query:
+                query_terms.update(re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ0-9]{4,}", query.casefold()))
+    stop_words = {
+        "aktuell", "aktuelle", "aktuellen", "nachricht", "nachrichten", "neuigkeit", "neuigkeiten",
+        "neues", "heute", "gestern", "diese", "dieser", "dieses", "sind", "wird", "wurde",
+        "wurde", "über", "nach", "with", "what", "news", "latest", "today", "yesterday",
+    }
+    query_terms.difference_update(stop_words)
+    candidates: list[tuple[int, int, dict[str, str]]] = []
+    position = 0
+    for group in groups:
+        for source in group:
+            haystack = f"{source.get('title', '')} {source.get('snippet', '')}".casefold()
+            score = sum(2 if term in source.get("title", "").casefold() else 1 for term in query_terms if term in haystack)
+            candidates.append((score, position, source))
+            position += 1
+    if query_terms and any(score for score, _, _ in candidates):
+        candidates = [item for item in candidates if item[0] > 0]
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    merged: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _, _, source in candidates:
+        url = source.get("url", "")
+        title = source.get("title", "")
+        key = (urlparse(url).netloc.casefold(), re.sub(r"\W+", "", title.casefold())[:100])
+        if not url or key in seen:
+            continue
+        seen.add(key)
+        merged.append({key: value for key, value in source.items() if key != "query"})
+        if len(merged) == limit:
+            return merged
+    return merged
+
+
+def _tag_sources_for_query(sources: list[dict[str, str]], query: str) -> list[dict[str, str]]:
+    """Add the local query only for ranking; never expose it to the browser."""
+    return [{**source, "query": query} for source in sources]
 
 
 def _configured_search_key(name: str) -> str:
@@ -825,14 +882,20 @@ async def _bing_news_fallback(query: str) -> list[dict[str, str]]:
 async def _tavily_search(query: str, api_key: str) -> list[dict[str, str]]:
     """Use Tavily's supported API rather than scraping a public search page."""
     search_query, _, _ = _web_search_query(query)
+    topic = _search_topic(query)
+    current = _is_current_search(query)
     body = {
         "query": search_query,
-        "topic": _search_topic(query),
-        "search_depth": "basic",
-        "max_results": 5,
+        "topic": topic,
+        "search_depth": "advanced" if topic in {"news", "finance"} else "basic",
+        "max_results": 4,
         "include_answer": False,
         "include_raw_content": False,
     }
+    if body["search_depth"] == "advanced":
+        body["chunks_per_source"] = 1
+    if current:
+        body["time_range"] = "day" if any(term in query.casefold() for term in ("heute", "today")) else "week"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
             response = await client.post(
@@ -857,7 +920,7 @@ async def _tavily_search(query: str, api_key: str) -> list[dict[str, str]]:
         if published:
             snippet = f"{published} · {snippet}"
         results.append({"title": title[:240], "url": url[:1_500], "snippet": snippet[:800], "provider": "Tavily"})
-        if len(results) == 5:
+        if len(results) == 4:
             break
     return results
 
@@ -867,15 +930,15 @@ async def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
     search_query, _, _ = _web_search_query(query)
     topic = _search_topic(query)
     is_news = topic in {"news", "finance"}
-    params = {"q": search_query, "count": "5", "country": "DE", "search_lang": "de", "spellcheck": "1"}
-    if any(term in query.casefold() for term in ("heute", "gestern", "aktuell", "neueste", "neues", "today", "yesterday")):
-        params["freshness"] = "pd"
+    params = {"q": search_query, "count": "4", "country": "DE", "search_lang": "de", "ui_lang": "de-DE", "spellcheck": "1"}
+    if _is_current_search(query):
+        params["freshness"] = "pd" if any(term in query.casefold() for term in ("heute", "today")) else "pw"
     endpoint = "https://api.search.brave.com/res/v1/news/search" if is_news else "https://api.search.brave.com/res/v1/web/search"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
             response = await client.get(
                 endpoint,
-                headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+                headers={"X-Subscription-Token": api_key, "Accept": "application/json", "Cache-Control": "no-cache"},
                 params=params,
             )
             response.raise_for_status()
@@ -893,7 +956,7 @@ async def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
         if not title or not url.startswith(("https://", "http://")):
             continue
         results.append({"title": title[:240], "url": url[:1_500], "snippet": snippet[:800], "provider": "Brave Search"})
-        if len(results) == 5:
+        if len(results) == 4:
             break
     return results
 
@@ -964,19 +1027,21 @@ async def _duckduckgo_search(query: str) -> tuple[list[dict[str, str]], str, str
 
 
 async def _web_search(query: str, provider_choice: str) -> tuple[list[dict[str, str]], str, str, str]:
-    """Choose a supported provider, keeping the legacy public search only as opt-in fallback."""
+    """Use both configured engines automatically; retain the public fallback only as a last resort."""
     search_query, _, timestamp = _web_search_query(query)
     scoreboard_sources = await _fifa_world_cup_scoreboard(query)
     tavily_key = _configured_search_key("TAVILY_API_KEY")
     brave_key = _configured_search_key("BRAVE_SEARCH_API_KEY")
 
     choices = {
-        "auto": (["tavily", "brave", "fallback"], "Automatisch"),
+        "auto": (["brave", "tavily", "fallback"] if _search_topic(query) in {"news", "finance"} else ["tavily", "brave", "fallback"], "Automatisch"),
         "tavily": (["tavily"], "Tavily"),
         "brave": (["brave"], "Brave Search"),
         "fallback": (["fallback"], "Öffentliche Fallback-Suche"),
     }
     selected, label = choices.get(provider_choice, choices["auto"])
+    collected: list[dict[str, str]] = []
+    used_providers: list[str] = []
     for provider in selected:
         if provider == "tavily":
             if not tavily_key:
@@ -985,7 +1050,11 @@ async def _web_search(query: str, provider_choice: str) -> tuple[list[dict[str, 
                 continue
             results = await _tavily_search(query, tavily_key)
             if results:
-                return (scoreboard_sources + results)[:5], search_query, timestamp, "ESPN Scoreboard + Tavily" if scoreboard_sources else "Tavily"
+                collected.extend(results)
+                used_providers.append("Tavily")
+                if provider_choice == "tavily":
+                    return _merge_sources(_tag_sources_for_query(scoreboard_sources, query), _tag_sources_for_query(results, query)), search_query, timestamp, "ESPN Scoreboard + Tavily" if scoreboard_sources else "Tavily"
+                continue
             if provider_choice == "tavily":
                 return scoreboard_sources, search_query, timestamp, "Tavily lieferte keine verwertbaren Treffer"
         elif provider == "brave":
@@ -995,12 +1064,22 @@ async def _web_search(query: str, provider_choice: str) -> tuple[list[dict[str, 
                 continue
             results = await _brave_search(query, brave_key)
             if results:
-                return (scoreboard_sources + results)[:5], search_query, timestamp, "ESPN Scoreboard + Brave Search" if scoreboard_sources else "Brave Search"
+                collected.extend(results)
+                used_providers.append("Brave Search")
+                if provider_choice == "brave":
+                    return _merge_sources(_tag_sources_for_query(scoreboard_sources, query), _tag_sources_for_query(results, query)), search_query, timestamp, "ESPN Scoreboard + Brave Search" if scoreboard_sources else "Brave Search"
+                continue
             if provider_choice == "brave":
                 return scoreboard_sources, search_query, timestamp, "Brave Search lieferte keine verwertbaren Treffer"
         else:
+            if collected:
+                provider = " + ".join(used_providers)
+                return _merge_sources(_tag_sources_for_query(scoreboard_sources, query), _tag_sources_for_query(collected, query)), search_query, timestamp, f"ESPN Scoreboard + {provider}" if scoreboard_sources else provider
             results, _, _, used_provider = await _duckduckgo_search(query)
             return results, search_query, timestamp, used_provider
+    if collected:
+        provider = " + ".join(used_providers)
+        return _merge_sources(_tag_sources_for_query(scoreboard_sources, query), _tag_sources_for_query(collected, query)), search_query, timestamp, f"ESPN Scoreboard + {provider}" if scoreboard_sources else provider
     return scoreboard_sources, search_query, timestamp, f"{label}: kein konfigurierter Suchanbieter"
 
 
@@ -1219,6 +1298,8 @@ async def chat(request: ChatRequest) -> dict:
                 f"Search query: {search_query}\n"
                 f"Search provider: {search_provider}\n"
                 "Use only these sources for factual claims and cite their matching source number. "
+                "Answer the user directly and concisely. Do not repeat source snippets, URLs, the search query, "
+                "or the research process; clickable source links are appended after your answer. "
                 "For dated sports fixtures/results, copy the date, teams, score and status exactly from the source title; "
                 "never add a team, score or match event that is absent from the sources.\n" + "\n".join(
                     f"[{index}] {source['title']}\n{source['snippet']}\n{source['url']}"
@@ -1269,8 +1350,7 @@ async def chat(request: ChatRequest) -> dict:
         grounded_answer = _ground_unambiguous_score(answer, latest_question, sources)
         source_links = ""
         if sources:
-            provider_note = f"*Recherche: {search_provider}.*\n\n" if search_provider else ""
-            source_links = f"\n\n{provider_note}### Quellen\n" + "\n".join(
+            source_links = "\n\n### Quellen\n" + "\n".join(
                 f"[{index}] [{source['title']}]({source['url']})"
                 for index, source in enumerate(sources, start=1)
             )
@@ -1326,8 +1406,7 @@ async def chat(request: ChatRequest) -> dict:
     grounded_answer = _ground_unambiguous_score(answer.strip(), latest_question, sources)
     source_links = ""
     if sources:
-        provider_note = f"*Recherche: {search_provider}.*\n\n" if search_provider else ""
-        source_links = f"\n\n{provider_note}### Quellen\n" + "\n".join(
+        source_links = "\n\n### Quellen\n" + "\n".join(
             f"[{index}] [{source['title']}]({source['url']})"
             for index, source in enumerate(sources, start=1)
         )

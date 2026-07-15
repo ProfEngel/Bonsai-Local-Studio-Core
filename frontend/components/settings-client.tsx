@@ -185,7 +185,7 @@ export function SettingsClient() {
             <label className="block space-y-2 text-sm font-medium">
               Suchanbieter
               <select value={settings.webSearchProvider} onChange={(event) => update("webSearchProvider", event.target.value as StudioSettings["webSearchProvider"])} className="flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
-                <option value="auto">Automatisch (Tavily → Brave → Fallback)</option>
+                <option value="auto">Automatisch (Tavily + Brave → Fallback)</option>
                 <option value="tavily">Tavily</option>
                 <option value="brave">Brave Search</option>
                 <option value="fallback">Öffentliche Fallback-Suche</option>
@@ -196,7 +196,7 @@ export function SettingsClient() {
               <label className="block space-y-2 text-sm font-medium">Brave Search API-Schlüssel <span className="text-xs font-normal text-muted">{searchStatus.braveConfigured ? "konfiguriert" : "noch nicht konfiguriert"}</span><Input type="password" autoComplete="new-password" value={braveKey} onChange={(event) => setBraveKey(event.target.value)} placeholder="BSA…" /></label>
             </div>
             <div className="flex flex-wrap items-center gap-3"><Button type="button" variant="outline" size="sm" onClick={() => void saveSearchKeys()} disabled={searchSaving}>{searchSaving ? "Speichere …" : "Suchschlüssel lokal speichern"}</Button>{searchMessage ? <span className="text-xs text-muted">{searchMessage}</span> : null}</div>
-            <p className="text-xs text-muted">Automatisch nutzt Tavily, dann Brave, dann den transparent markierten öffentlichen Fallback. Bei Tavily oder Brave wird nur der aktuelle Suchprompt an den gewählten Anbieter gesendet.</p>
+            <p className="text-xs text-muted">Automatisch gleicht Tavily und Brave ab; bei aktuellen Nachrichten priorisiert es die Brave-News-Suche. Erst ohne Treffer kommt der transparent markierte öffentliche Fallback zum Zug. Bei Tavily oder Brave wird nur der aktuelle Suchprompt an den jeweiligen Anbieter gesendet.</p>
           </div>
           <label className="block space-y-2 text-sm font-medium">
             Chat-Systemanweisung

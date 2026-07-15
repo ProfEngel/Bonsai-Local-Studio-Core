@@ -18,7 +18,6 @@ const HISTORY_EXCERPT_LIMIT = 6_000;
 
 type AttachmentKind = "text" | "pdf" | "image";
 type Attachment = { id: string; name: string; kind: AttachmentKind; excerpt: string; note?: string; previewDataUrl?: string; dataUrl?: string };
-type Source = { title: string; url: string; snippet: string };
 type ChatAgentProfile = { id: string; name: string; description: string; webSearchDefault: boolean; systemPrompt: string };
 type ChatMessage = {
   id: string;
@@ -26,7 +25,6 @@ type ChatMessage = {
   content: string;
   createdAt: string;
   attachments?: Attachment[];
-  sources?: Source[];
   runner?: string;
 };
 type Conversation = { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[] };
@@ -300,10 +298,10 @@ export function ChatClient() {
           system_prompt: settings.chatSystemPrompt,
         }),
       });
-      const payload = await response.json().catch(() => null) as { message?: string; sources?: Source[]; runner?: string; detail?: string } | null;
+      const payload = await response.json().catch(() => null) as { message?: string; runner?: string; detail?: string } | null;
       if (!response.ok || !payload?.message) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
       const answer: ChatMessage = {
-        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), sources: payload.sources ?? [], runner: payload.runner,
+        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), runner: payload.runner,
       };
       setConversations((current) => current.map((conversation) => conversation.id === conversationId ? {
         ...conversation, updatedAt: answer.createdAt, messages: [...conversation.messages, answer],
@@ -354,7 +352,6 @@ export function ChatClient() {
                     }}
                   >{message.content}</ReactMarkdown>
                   {message.attachments?.length ? <div className="mt-3 flex flex-wrap gap-2 border-t border-current/15 pt-2 text-xs opacity-85">{message.attachments.map((attachment) => <div key={attachment.id} className="flex max-w-52 items-center gap-2 rounded-lg border border-current/15 px-2 py-1.5">{attachment.kind === "image" && attachment.previewDataUrl ? <NextImage src={attachment.previewDataUrl} alt={`Vorschau von ${attachment.name}`} width={40} height={40} unoptimized className="size-10 rounded object-cover" /> : attachment.kind === "image" ? <ImageIcon className="size-4" /> : <FileText className="size-4" />}<span className="min-w-0"><span className="block truncate">{attachment.name}</span><span className="block text-[10px]">{attachment.note ?? attachment.kind}</span></span></div>)}</div> : null}
-                  {message.sources?.length ? <div className="mt-3 space-y-2 border-t border-border pt-2 text-xs text-muted">{message.sources.map((source) => <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="block hover:text-foreground"><span className="font-medium text-muted-strong">{source.title}</span>{source.snippet ? <span className="block mt-0.5">{source.snippet}</span> : null}</a>)}</div> : null}
                 </article>
               )) : <div className="grid h-full place-items-center text-center text-sm text-muted"><div><MessageCircle className="mx-auto mb-3 size-7" />Beginne eine lokale Unterhaltung mit Bonsai-27B.</div></div>}
               {isSending ? <div className="flex items-center gap-2 text-sm text-muted"><LoaderCircle className="size-4 animate-spin" />{selectedAgent ? "Goose-Harness führt den Agenten aus …" : "Bonsai antwortet …"}</div> : null}
@@ -375,7 +372,7 @@ export function ChatClient() {
                 </div>
                 <Button type="submit" disabled={isSending || isReadingFiles || (!draft.trim() && attachments.length === 0)}><Send className="size-4" />Senden</Button>
               </div>
-              <p className="mt-3 text-[10px] text-muted">Enter sendet, Umschalt-Enter erstellt eine neue Zeile. Text, PDFs und Bilder bleiben lokal. Bei aktivierter Suche wird nur die aktuelle Frage an den in Settings gewählten Anbieter gesendet; Quellen und der tatsächlich verwendete Weg erscheinen in der Antwort. Für FIFA-Spielanfragen ergänzt der öffentliche ESPN-Spielplan aktuelle Paarungen und Ergebnisse.</p>
+              <p className="mt-3 text-[10px] text-muted">Enter sendet, Umschalt-Enter erstellt eine neue Zeile. Text, PDFs und Bilder bleiben lokal. Bei aktivierter Suche wird nur die aktuelle Frage an den in Settings gewählten Anbieter gesendet; kompakte Quellenlinks erscheinen unter der Antwort. Für FIFA-Spielanfragen ergänzt der öffentliche ESPN-Spielplan aktuelle Paarungen und Ergebnisse.</p>
             </form>
           </section>
         </div>
