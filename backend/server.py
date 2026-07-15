@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.responses import StreamingResponse
 import mlx.core as mx
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -111,6 +112,7 @@ GOOSE_MODEL = os.getenv("BONSAI_GOOSE_MODEL", "Ternary-Bonsai-27B-mlx-2bit")
 MAIL_ACCOUNT = os.getenv("BONSAI_MAIL_ACCOUNT", "Exchange")
 MAIL_INBOX = os.getenv("BONSAI_MAIL_INBOX", "Posteingang")
 _goose_agent_locks: dict[str, asyncio.Lock] = {}
+_news_briefing_lock = asyncio.Lock()
 WEB_SEARCH_CONFIG_PATH = Path(
     os.getenv(
         "BONSAI_WEB_SEARCH_CONFIG",
@@ -375,6 +377,8 @@ class ChatAgentProfile(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(min_length=1, max_length=280)
     webSearchDefault: bool = False
+    streamProgress: bool = False
+    starterPrompt: str | None = Field(default=None, max_length=2_000)
     systemPrompt: str = Field(min_length=1, max_length=8_000)
 
 
@@ -1101,6 +1105,176 @@ def _ground_unambiguous_score(answer: str, question: str, sources: list[dict[str
     return f"Nach den Suchquellen lautet das Ergebnis **{grounded_score}**.\n\n{answer}"
 
 
+NEWS_BRIEFING_AGENT_ID = "news-briefing"
+NEWS_BRIEFING_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("Welt", "Aktuelle Nachrichten der letzten 24 Stunden Weltpolitik und Weltgeschehen"),
+    ("Deutschland", "Aktuelle Nachrichten der letzten 24 Stunden Deutschland Bundespolitik und Gesellschaft"),
+    ("Region Stuttgart", "Aktuelle Nachrichten der letzten 24 Stunden Region Stuttgart Baden-Württemberg"),
+    ("Wirtschaft & Finanzen", "Aktuelle Nachrichten der letzten 24 Stunden Wirtschaft Finanzen Börse Deutschland Welt"),
+    ("Sport", "Aktuelle Nachrichten der letzten 24 Stunden VfB Stuttgart DFB Nationalmannschaft und wichtiger Sport"),
+    ("HfWU", "site:hfwu.de HfWU Nürtingen-Geislingen aktuelle Nachrichten der letzten 24 Stunden"),
+)
+
+
+def _sse_event(event: str, payload: dict[str, object]) -> str:
+    """Serialize a small server-sent event without exposing implementation state."""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _local_llm_completion(
+    *,
+    endpoint: str,
+    model: str,
+    system: str,
+    prompt: str,
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    """Call the configured local Bonsai endpoint with thinking explicitly disabled."""
+    body = {
+        "model": model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=5.0)) as client:
+            response = await client.post(f"{endpoint}/chat/completions", json=body)
+        response.raise_for_status()
+        answer = response.json()["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Lokaler News-Agent konnte Bonsai-27B nicht erreichen: {exc}") from exc
+    answer = re.sub(r"<think>.*?</think>\s*", "", str(answer), flags=re.IGNORECASE | re.DOTALL).strip()
+    if not answer:
+        raise HTTPException(status_code=502, detail="Lokaler News-Agent erhielt keine nutzbare LLM-Antwort.")
+    return answer
+
+
+async def _news_briefing_sources(provider_choice: str) -> tuple[list[dict[str, str]], str]:
+    """Collect a bounded source set without bursting provider rate limits."""
+    results = []
+    for index, (_, query) in enumerate(NEWS_BRIEFING_SECTIONS):
+        results.append(await _web_search(query, provider_choice))
+        if provider_choice == "brave" and index < len(NEWS_BRIEFING_SECTIONS) - 1:
+            await asyncio.sleep(1.1)
+    sources: list[dict[str, str]] = []
+    for (section, _), (section_sources, _, _, _) in zip(NEWS_BRIEFING_SECTIONS, results, strict=True):
+        for source in section_sources:
+            sources.append({**source, "section": section})
+    unique: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source in sources:
+        url = source["url"]
+        if url in seen:
+            continue
+        seen.add(url)
+        unique.append(source)
+    timestamp = datetime.now(BERLIN_TIMEZONE).strftime("%d.%m.%Y, %H:%M %Z")
+    return unique[:18], timestamp
+
+
+def _news_source_context(sources: list[dict[str, str]]) -> str:
+    return "\n\n".join(
+        f"[{index}] Ressort: {source['section']}\nTitel: {source['title']}\nAuszug: {source['snippet'][:500]}\nURL: {source['url']}"
+        for index, source in enumerate(sources, start=1)
+    )
+
+
+def _news_source_links(answer: str, sources: list[dict[str, str]]) -> str:
+    cited = {int(value) for value in re.findall(r"\[(\d{1,2})\]", answer)}
+    selected = [(index, source) for index, source in enumerate(sources, start=1) if index in cited]
+    if not selected:
+        selected = list(enumerate(sources[:6], start=1))
+    return "\n\n### Quellen\n" + "\n".join(
+        f"[{index}] [{source['section']}: {source['title']}]({source['url']})"
+        for index, source in selected
+    )
+
+
+def _judge_news_draft(answer: str) -> tuple[Literal["pass", "revise"], list[str]]:
+    """Parse the small judge contract conservatively; malformed output triggers one revision."""
+    match = re.search(r"\{.*\}", answer, flags=re.DOTALL)
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+            verdict = str(payload.get("verdict", "revise")).casefold()
+            issues = [str(item)[:240] for item in payload.get("issues", []) if str(item).strip()]
+            return ("pass" if verdict == "pass" else "revise", issues[:6])
+        except (TypeError, ValueError):
+            pass
+    return "revise", ["Der Richterlauf lieferte kein prüfbares Ergebnisformat; bitte Fakten und Quellenmarkierungen nochmals verdichten."]
+
+
+async def _news_briefing_events(request: ChatRequest, profile: ChatAgentProfile):
+    """Emit real progress while a bounded draft-and-judge workflow runs locally."""
+    async with _news_briefing_lock:
+        try:
+            yield _sse_event("progress", {"step": 1, "total": 5, "label": "Zeitstempel erfasst", "detail": datetime.now(BERLIN_TIMEZONE).strftime("%d.%m.%Y, %H:%M %Z")})
+            yield _sse_event("progress", {"step": 2, "total": 5, "label": "24-Stunden-Quellen werden abgeglichen", "detail": "Welt, Deutschland, Stuttgart, Wirtschaft, Sport und HfWU"})
+            sources, timestamp = await _news_briefing_sources(request.web_search_provider)
+            if not sources:
+                raise HTTPException(status_code=502, detail="Für das 24-Stunden-Briefing wurden keine verwertbaren Quellen gefunden.")
+            source_context = _news_source_context(sources)
+            yield _sse_event("progress", {"step": 3, "total": 5, "label": "Erster Entwurf entsteht", "detail": f"{len(sources)} quellenbasierte Treffer im Zeitfenster"})
+            user_request = next((item.content for item in reversed(request.messages) if item.role == "user"), "")
+            draft_prompt = "\n\n".join((
+                f"Zeitstempel: {timestamp}. Zeitraum: die letzten 24 Stunden.",
+                f"Nutzerauftrag: {user_request}",
+                "Erstelle ein kompaktes deutsches News-Briefing mit genau den Überschriften Welt, Deutschland, Region Stuttgart, Wirtschaft & Finanzen, Sport und HfWU. Nenne pro Bereich nur wirklich relevante und aktuelle Meldungen. Jede Tatsachenbehauptung trägt die passende Quellenmarkierung [n]. Wenn es keinen belastbaren aktuellen Treffer gibt, schreibe genau: Keine belastbare aktuelle Meldung gefunden.",
+                "Quellenmaterial:\n" + source_context,
+            ))
+            draft = await _local_llm_completion(
+                endpoint=request.llm_url,
+                model=request.model,
+                system=profile.systemPrompt,
+                prompt=draft_prompt,
+                temperature=0.2,
+                max_tokens=1_600,
+            )
+            for iteration in range(1, 4):
+                yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Qualitätsprüfung {iteration}/3", "detail": "Aktualität, Relevanz, Quellenbezug und Dopplungen"})
+                judge_prompt = "\n\n".join((
+                    "Prüfe den folgenden News-Entwurf ausschließlich gegen das Quellenmaterial. Prüfkriterien: letzte 24 Stunden, jede Tatsachenbehauptung durch passende [n]-Quelle gedeckt, alle sechs Überschriften vorhanden, keine Doppelungen, keine Spekulationen. Antworte ausschließlich als JSON: {\"verdict\":\"pass\"|\"revise\",\"issues\":[\"kurze konkrete Beanstandung\"]}.",
+                    "ENTWURF:\n" + draft,
+                    "QUELLEN:\n" + source_context,
+                ))
+                verdict_text = await _local_llm_completion(
+                    endpoint=request.llm_url,
+                    model=request.model,
+                    system="Du bist ein strenger, deutschsprachiger Faktenprüfer. Gib ausschließlich valides JSON im verlangten Schema aus; keine Denkspur.",
+                    prompt=judge_prompt,
+                    temperature=0.0,
+                    max_tokens=500,
+                )
+                verdict, issues = _judge_news_draft(verdict_text)
+                if verdict == "pass" or iteration == 3:
+                    break
+                yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Nachbesserung {iteration}/2", "detail": "; ".join(issues[:2]) or "Quellenbezug wird verdichtet"})
+                revision_prompt = "\n\n".join((
+                    "Überarbeite den Entwurf. Behalte nur nachweisbare aktuelle Inhalte, behalte alle sechs Überschriften und zitiere jede Tatsachenbehauptung als [n]. Gib nur den fertigen Bericht aus.",
+                    "BEANSTANDUNGEN:\n" + "\n".join(f"- {issue}" for issue in issues),
+                    "ENTWURF:\n" + draft,
+                    "QUELLEN:\n" + source_context,
+                ))
+                draft = await _local_llm_completion(
+                    endpoint=request.llm_url,
+                    model=request.model,
+                    system=profile.systemPrompt,
+                    prompt=revision_prompt,
+                    temperature=0.1,
+                    max_tokens=1_600,
+                )
+            final_message = f"*Stand: {timestamp} · Zeitraum: letzte 24 Stunden*\n\n{draft.strip()}{_news_source_links(draft, sources)}"
+            yield _sse_event("progress", {"step": 5, "total": 5, "label": "Briefing geprüft und fertig", "detail": "Maximal drei Entwurfszyklen eingehalten"})
+            yield _sse_event("result", {"message": final_message, "runner": "Lokaler News-Workflow · Bonsai-27B"})
+        except HTTPException as exc:
+            yield _sse_event("error", {"detail": str(exc.detail)})
+        except Exception:
+            log.exception("News briefing workflow failed")
+            yield _sse_event("error", {"detail": "Der News-Workflow ist unerwartet fehlgeschlagen."})
+
+
 def _attachment_context(attachments: list[ChatAttachment], *, vision_enabled: bool) -> str:
     if not attachments:
         return ""
@@ -1269,6 +1443,24 @@ async def get_studio_settings() -> dict:
 async def update_studio_settings(request: PersistentStudioSettings) -> dict:
     """Persist non-secret Studio preferences outside the checkout."""
     return {"settings": _write_persistent_studio_settings(request)}
+
+
+@app.post("/chat/stream")
+async def stream_chat(request: ChatRequest) -> StreamingResponse:
+    """Provide genuine progress events for explicitly opt-in local agent workflows."""
+    if request.agent_id != NEWS_BRIEFING_AGENT_ID:
+        raise HTTPException(status_code=400, detail="Dieser Agent unterstützt keinen Fortschritts-Stream.")
+    resolved = _find_chat_agent_profile(request.agent_id)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Der ausgewählte lokale Agent wurde nicht gefunden.")
+    profile, _ = resolved
+    if not profile.streamProgress:
+        raise HTTPException(status_code=400, detail="Der ausgewählte Agent ist nicht als Fortschritts-Workflow konfiguriert.")
+    return StreamingResponse(
+        _news_briefing_events(request, profile),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/chat")

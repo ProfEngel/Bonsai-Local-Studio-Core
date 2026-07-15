@@ -18,7 +18,8 @@ const HISTORY_EXCERPT_LIMIT = 6_000;
 
 type AttachmentKind = "text" | "pdf" | "image";
 type Attachment = { id: string; name: string; kind: AttachmentKind; excerpt: string; note?: string; previewDataUrl?: string; dataUrl?: string };
-type ChatAgentProfile = { id: string; name: string; description: string; webSearchDefault: boolean; systemPrompt: string };
+type ChatAgentProfile = { id: string; name: string; description: string; webSearchDefault: boolean; streamProgress?: boolean; starterPrompt?: string | null; systemPrompt: string };
+type AgentProgress = { step: number; total: number; label: string; detail?: string };
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -121,6 +122,7 @@ export function ChatClient() {
   const [webSearch, setWebSearch] = useState(false);
   const [agentProfiles, setAgentProfiles] = useState<ChatAgentProfile[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [agentProgress, setAgentProgress] = useState<AgentProgress[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [isReadingFiles, setIsReadingFiles] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -177,6 +179,7 @@ export function ChatClient() {
     setActiveId(conversation.id);
     setDraft("");
     setAttachments([]);
+    setAgentProgress([]);
     setError(null);
   }, []);
 
@@ -282,24 +285,67 @@ export function ChatClient() {
 
     try {
       const settings = await readPersistentStudioSettings() ?? readStudioSettings();
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: history.map(({ role, content }) => ({ role, content })),
-          attachments,
-          web_search: webSearch,
-          web_search_provider: settings.webSearchProvider,
-          llm_url: settings.llmUrl,
-          model: settings.model,
-          vision_llm_url: settings.visionLlmUrl,
-          vision_model: settings.visionModel,
-          agent_id: selectedAgent?.id,
-          system_prompt: settings.chatSystemPrompt,
-        }),
-      });
-      const payload = await response.json().catch(() => null) as { message?: string; runner?: string; detail?: string } | null;
-      if (!response.ok || !payload?.message) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
+      const requestBody = {
+        messages: history.map(({ role, content }) => ({ role, content })),
+        attachments,
+        web_search: webSearch,
+        web_search_provider: settings.webSearchProvider,
+        llm_url: settings.llmUrl,
+        model: settings.model,
+        vision_llm_url: settings.visionLlmUrl,
+        vision_model: settings.visionModel,
+        agent_id: selectedAgent?.id,
+        system_prompt: settings.chatSystemPrompt,
+      };
+      let payload: { message?: string; runner?: string; detail?: string } | null;
+      if (selectedAgent?.streamProgress) {
+        setAgentProgress([]);
+        const response = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        });
+        if (!response.ok || !response.body) {
+          const errorPayload = await response.json().catch(() => null);
+          throw new Error(parseError(errorPayload, "Der News-Workflow konnte nicht gestartet werden."));
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalPayload: { message?: string; runner?: string; detail?: string } | null = null;
+        const handleEvent = (raw: string) => {
+          const event = raw.match(/^event:\s*(.+)$/m)?.[1]?.trim();
+          const data = raw.match(/^data:\s*(.+)$/m)?.[1];
+          if (!event || !data) return;
+          const eventPayload = JSON.parse(data) as AgentProgress & { message?: string; runner?: string; detail?: string };
+          if (event === "progress") {
+            setAgentProgress((current) => [...current, { step: eventPayload.step, total: eventPayload.total, label: eventPayload.label, detail: eventPayload.detail }]);
+          } else if (event === "result") {
+            finalPayload = eventPayload;
+          } else if (event === "error") {
+            throw new Error(eventPayload.detail || "Der News-Workflow ist fehlgeschlagen.");
+          }
+        };
+        while (true) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const events = buffer.split("\n\n");
+          buffer = events.pop() ?? "";
+          events.forEach(handleEvent);
+          if (done) break;
+        }
+        if (buffer.trim()) handleEvent(buffer);
+        payload = finalPayload;
+      } else {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(requestBody),
+        });
+        payload = await response.json().catch(() => null) as { message?: string; runner?: string; detail?: string } | null;
+        if (!response.ok) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
+      }
+      if (!payload?.message) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
       const answer: ChatMessage = {
         id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), runner: payload.runner,
       };
@@ -354,13 +400,14 @@ export function ChatClient() {
                   {message.attachments?.length ? <div className="mt-3 flex flex-wrap gap-2 border-t border-current/15 pt-2 text-xs opacity-85">{message.attachments.map((attachment) => <div key={attachment.id} className="flex max-w-52 items-center gap-2 rounded-lg border border-current/15 px-2 py-1.5">{attachment.kind === "image" && attachment.previewDataUrl ? <NextImage src={attachment.previewDataUrl} alt={`Vorschau von ${attachment.name}`} width={40} height={40} unoptimized className="size-10 rounded object-cover" /> : attachment.kind === "image" ? <ImageIcon className="size-4" /> : <FileText className="size-4" />}<span className="min-w-0"><span className="block truncate">{attachment.name}</span><span className="block text-[10px]">{attachment.note ?? attachment.kind}</span></span></div>)}</div> : null}
                 </article>
               )) : <div className="grid h-full place-items-center text-center text-sm text-muted"><div><MessageCircle className="mx-auto mb-3 size-7" />Beginne eine lokale Unterhaltung mit Bonsai-27B.</div></div>}
-              {isSending ? <div className="flex items-center gap-2 text-sm text-muted"><LoaderCircle className="size-4 animate-spin" />{selectedAgent ? "Goose-Harness führt den Agenten aus …" : "Bonsai antwortet …"}</div> : null}
+              {agentProgress.length ? <div className="rounded-xl border border-border bg-surface-strong p-3 text-xs text-muted"><p className="mb-2 font-medium text-muted-strong">News-Briefing – Arbeitsfortschritt</p><ol className="space-y-1.5">{agentProgress.map((progress, index) => <li key={`${progress.step}-${progress.label}-${index}`} className="flex gap-2"><span className="font-mono text-muted">{progress.step}/{progress.total}</span><span><span className="text-muted-strong">{progress.label}</span>{progress.detail ? <span className="block text-[11px]">{progress.detail}</span> : null}</span></li>)}</ol></div> : null}
+              {isSending ? <div className="flex items-center gap-2 text-sm text-muted"><LoaderCircle className="size-4 animate-spin" />{selectedAgent?.streamProgress ? "News-Briefing wird recherchiert und geprüft …" : selectedAgent ? "Goose-Harness führt den Agenten aus …" : "Bonsai antwortet …"}</div> : null}
               <div ref={messagesEndRef} />
             </div>
 
             <form ref={formRef} onSubmit={send} className="border-t border-border-strong p-4 sm:p-5">
-              {agentProfiles.length ? <div className="mb-3 flex flex-wrap items-center gap-2"><span className="mr-1 text-xs text-muted">Agent:</span><button type="button" onClick={() => setSelectedAgentId(null)} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === null ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>Allgemein</button>{agentProfiles.map((agent) => <button key={agent.id} type="button" onClick={() => { setSelectedAgentId(agent.id); setWebSearch(agent.webSearchDefault); }} title={agent.description} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === agent.id ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>{agent.name}</button>)}</div> : null}
-              {selectedAgent ? <p className="mb-3 text-xs text-muted">{selectedAgent.description} Dieser Agent läuft über den eingeschränkten Goose-Harness.{selectedAgent.webSearchDefault ? " Webrecherche ist für diesen Agenten voreingestellt." : ""}</p> : null}
+              {agentProfiles.length ? <div className="mb-3 flex flex-wrap items-center gap-2"><span className="mr-1 text-xs text-muted">Agent:</span><button type="button" onClick={() => { setSelectedAgentId(null); setAgentProgress([]); }} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === null ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>Allgemein</button>{agentProfiles.map((agent) => <button key={agent.id} type="button" onClick={() => { setSelectedAgentId(agent.id); setWebSearch(agent.webSearchDefault); setAgentProgress([]); if (agent.starterPrompt) setDraft(agent.starterPrompt); }} title={agent.description} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === agent.id ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>{agent.name}</button>)}</div> : null}
+              {selectedAgent ? <p className="mb-3 text-xs text-muted">{selectedAgent.description} {selectedAgent.streamProgress ? "Dieser Agent zeigt den kontrollierten lokalen Recherche- und Prüfablauf live an." : "Dieser Agent läuft über den eingeschränkten Goose-Harness."}{selectedAgent.webSearchDefault ? " Webrecherche ist für diesen Agenten voreingestellt." : ""}</p> : null}
               {attachments.length ? <div className="mb-3 flex flex-wrap gap-2">{attachments.map((attachment) => <span key={attachment.id} className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-surface-strong px-2 py-1 text-xs text-muted-strong">{attachment.kind === "image" && attachment.previewDataUrl ? <NextImage src={attachment.previewDataUrl} alt={`Vorschau von ${attachment.name}`} width={32} height={32} unoptimized className="size-8 rounded object-cover" /> : attachment.kind === "image" ? <ImageIcon className="size-3.5" /> : <FileText className="size-3.5" />}<span className="truncate">{attachment.name}</span><button type="button" onClick={() => removeAttachment(attachment.id)} aria-label={`${attachment.name} entfernen`} className="text-muted hover:text-foreground"><X className="size-3" /></button></span>)}</div> : null}
               <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); formRef.current?.requestSubmit(); } }} placeholder="Schreibe eine Nachricht …" className="min-h-24 resize-y rounded-xl text-sm leading-6" disabled={isSending || isReadingFiles} />
               {error ? <p role="alert" className="mt-2 text-xs text-red-400">{error}</p> : null}
