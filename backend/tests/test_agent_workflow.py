@@ -5,6 +5,20 @@ from pathlib import Path
 from backend import server
 
 
+def test_agent_skill_context_includes_small_data_files(tmp_path: Path) -> None:
+    agent_dir = tmp_path / "portfolio-analyst"
+    (agent_dir / "chat").mkdir(parents=True)
+    (agent_dir / "data").mkdir()
+    (agent_dir / "agent.yaml").write_text("id: portfolio-analyst\n")
+    (agent_dir / "SKILL.md").write_text("# Skill\n")
+    (agent_dir / "data" / "portfolio.md").write_text("# Portfolio-Basis\n- NVIDIA\n")
+
+    context = server._agent_skill_context(agent_dir / "chat" / "profile.json")
+
+    assert "Portfolio-Basis" in context
+    assert "NVIDIA" in context
+
+
 def test_agent_workflow_emits_progress_and_revises_once(monkeypatch) -> None:
     goose_calls: list[list[dict[str, str]]] = []
     judge_calls = 0
@@ -46,4 +60,3 @@ def test_agent_workflow_emits_progress_and_revises_once(monkeypatch) -> None:
     assert any(event.get("label") == "Nachbesserung 1/2" for event in events)
     assert any(event.get("label") == "Qualitätsprüfung 2/3" for event in events)
     assert len(goose_calls) == 2
-

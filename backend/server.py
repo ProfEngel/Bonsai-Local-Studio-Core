@@ -447,6 +447,7 @@ def _agent_skill_context(profile_path: Path, *, limit: int = 12_000) -> str:
         profile_path.parent.parent,
     )
     candidates = [agent_dir / "SKILL.md"]
+    candidates.extend(sorted((agent_dir / "data").glob("*.md")) if (agent_dir / "data").is_dir() else [])
     candidates.extend(sorted((agent_dir / "rules").glob("*.md")) if (agent_dir / "rules").is_dir() else [])
     candidates.extend(sorted((agent_dir / "workflows").glob("*.md")) if (agent_dir / "workflows").is_dir() else [])
     parts: list[str] = []
