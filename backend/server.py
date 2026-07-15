@@ -1381,6 +1381,148 @@ def _attachment_context(attachments: list[ChatAttachment], *, vision_enabled: bo
     return "\n\n".join(parts)
 
 
+def _agent_review_criteria(profile: ChatAgentProfile, *, has_sources: bool) -> str:
+    """Return concise, profile-specific quality criteria for the second LLM pass."""
+    criteria = [
+        "Antwortet vollständig und verständlich auf Deutsch auf den aktuellen Auftrag.",
+        "Enthält keine Denkspur, Selbstanalyse, Tool-Planung oder englischen Meta-Kommentar.",
+        "Hält alle Grenzen des Agentenprofils ein und erfindet keine externen Aktionen oder Fakten.",
+    ]
+    if has_sources:
+        criteria.append("Aktuelle Tatsachenbehauptungen sind durch das bereitgestellte Quellenmaterial gedeckt; keine Quelle wird erfunden.")
+    if profile.id == "portfolio-analyst":
+        criteria.extend((
+            "Trennt Fakten, Einordnung, Chancen, Risiken und offene Datenpunkte sauber.",
+            "Enthält keine individualisierte Kauf-, Verkaufs- oder Halteaufforderung und weist auf relevante Risiken hin.",
+        ))
+    elif profile.id == "gesundheits-navigator":
+        criteria.extend((
+            "Stellt keine Diagnose oder Therapieentscheidung dar und nennt bei passenden Warnzeichen klar die nötige Dringlichkeit.",
+            "Fragt nur die wichtigsten fehlenden Informationen ab und bleibt bei Fotos oder Symptomen transparent unsicher.",
+        ))
+    elif profile.id == "mailrundruf":
+        criteria.extend((
+            "Ist ausschließlich ein Entwurf beziehungsweise eine zulässige lesende Zusammenfassung; es wird kein Versand behauptet.",
+            "Bei einem Entwurf stehen Empfänger, Betreff und Ziel vor dem vollständigen Text und der Hinweis 'Entwurf – noch nicht versendet.' ist enthalten.",
+        ))
+    return "\n".join(f"- {item}" for item in criteria)
+
+
+def _agent_source_context(sources: list[dict[str, str]], *, timestamp: str, query: str, provider: str) -> str:
+    if not sources:
+        return (
+            "Webrecherche (lokal ausgelöst): keine verwertbaren Ergebnisse. "
+            "Der Agent darf zu aktuellen Fakten nichts aus Erinnerung behaupten, sondern muss diese Grenze klar nennen."
+        )
+    return "\n\n".join((
+        f"Webrecherche · Stand: {timestamp} · Anbieter: {provider} · Anfrage: {query}",
+        "Nutze für aktuelle Tatsachen ausschließlich dieses Material und markiere passende Quellen als [n].",
+        "\n".join(
+            f"[{index}] {source['title']}\n{source['snippet'][:700]}\n{source['url']}"
+            for index, source in enumerate(sources, start=1)
+        ),
+    ))
+
+
+def _agent_source_links(sources: list[dict[str, str]]) -> str:
+    if not sources:
+        return ""
+    return "\n\n### Quellen\n" + "\n".join(
+        f"[{index}] [{source['title']}]({source['url']})"
+        for index, source in enumerate(sources, start=1)
+    )
+
+
+async def _agent_workflow_events(request: ChatRequest, profile: ChatAgentProfile, profile_path: Path):
+    """Run a bounded Goose draft loop with visible, high-level review milestones."""
+    try:
+        user_request = next((item.content for item in reversed(request.messages) if item.role == "user"), "")
+        timestamp = datetime.now(BERLIN_TIMEZONE).strftime("%d.%m.%Y, %H:%M %Z")
+        yield _sse_event("progress", {"step": 1, "total": 5, "label": "Auftrag und Leitplanken erfasst", "detail": timestamp})
+
+        sources: list[dict[str, str]] = []
+        tool_context_parts: list[str] = []
+        if request.web_search:
+            yield _sse_event("progress", {"step": 2, "total": 5, "label": "Aktuelle Quellen werden abgeglichen", "detail": "Nur die aktuelle Frage wird recherchiert"})
+            sources, query, search_timestamp, provider = await _web_search(user_request, request.web_search_provider)
+            tool_context_parts.append(_agent_source_context(sources, timestamp=search_timestamp, query=query, provider=provider))
+        else:
+            yield _sse_event("progress", {"step": 2, "total": 5, "label": "Lokaler Kontext wird vorbereitet", "detail": "Keine externe Recherche aktiviert"})
+
+        image_attachments = [item for item in request.attachments if item.kind == "image" and item.data_url]
+        vision_enabled = bool(image_attachments and request.vision_llm_url and request.vision_model)
+        text_attachments = [item for item in request.attachments if item.kind != "image"]
+        attachment_context = _attachment_context(text_attachments, vision_enabled=False)
+        if attachment_context:
+            tool_context_parts.append(attachment_context)
+        if image_attachments:
+            if not vision_enabled:
+                raise HTTPException(status_code=422, detail="Bildanalyse im Agentenlauf benötigt den lokalen Vision-Endpunkt in den Studio-Einstellungen.")
+            vision_summary = await _vision_summary_for_harness(
+                endpoint=request.vision_llm_url or request.llm_url,
+                model=request.vision_model or request.model,
+                attachments=image_attachments,
+            )
+            tool_context_parts.append(f"Lokale Vision-Auswertung:\n{vision_summary}")
+        tool_context = "\n\n".join(tool_context_parts)
+        messages = [{"role": item.role, "content": item.content} for item in request.messages]
+
+        yield _sse_event("progress", {"step": 3, "total": 5, "label": "Erster Entwurf entsteht", "detail": "Der lokale Goose-Harness arbeitet innerhalb der Agentengrenzen"})
+        draft = await _run_goose_harness(
+            profile=profile,
+            profile_path=profile_path,
+            messages=messages,
+            tool_context=tool_context,
+            response_instruction=request.system_prompt,
+        )
+
+        criteria = _agent_review_criteria(profile, has_sources=bool(sources))
+        for iteration in range(1, 4):
+            yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Qualitätsprüfung {iteration}/3", "detail": "Auftrag, Sicherheitsgrenzen, Sprache und Quellenbezug"})
+            judge_prompt = "\n\n".join((
+                "Prüfe den Agentenentwurf streng gegen den Auftrag, die Profilregeln und den bereitgestellten Kontext.",
+                "Prüfkriterien:\n" + criteria,
+                f"NUTZERAUFTRAG:\n{user_request}",
+                f"PROFILREGELN:\n{profile.systemPrompt}",
+                f"KONTEXT:\n{tool_context}" if tool_context else "Kein zusätzlicher Recherche- oder Anhangskontext.",
+                f"ENTWURF:\n{draft}",
+                "Antworte ausschließlich als valides JSON: {\"verdict\":\"pass\"|\"revise\",\"issues\":[\"kurze konkrete Beanstandung\"]}. Keine Denkspur.",
+            ))
+            verdict_text = await _local_llm_completion(
+                endpoint=request.llm_url,
+                model=request.model,
+                system="Du bist ein strenger, deutschsprachiger Qualitätsprüfer. Gib ausschließlich valides JSON im verlangten Schema aus.",
+                prompt=judge_prompt,
+                temperature=0.0,
+                max_tokens=500,
+            )
+            verdict, issues = _judge_news_draft(verdict_text)
+            if verdict == "pass" or iteration == 3:
+                break
+            yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Nachbesserung {iteration}/2", "detail": "; ".join(issues[:2]) or "Entwurf wird präzisiert"})
+            revision_instruction = "\n".join((
+                "Überarbeite deine vorherige Antwort vollständig. Gib ausschließlich die fertige deutschsprachige Antwort aus; keine Denkspur oder Erläuterung der Überarbeitung.",
+                "Beanstandungen:",
+                *(f"- {issue}" for issue in issues),
+            ))
+            draft = await _run_goose_harness(
+                profile=profile,
+                profile_path=profile_path,
+                messages=[*messages, {"role": "assistant", "content": draft}, {"role": "user", "content": revision_instruction}],
+                tool_context=tool_context,
+                response_instruction=request.system_prompt,
+            )
+
+        final_message = f"*Stand: {timestamp}*\n\n{draft.strip()}{_agent_source_links(sources)}"
+        yield _sse_event("progress", {"step": 5, "total": 5, "label": "Antwort geprüft und fertig", "detail": "Maximal drei Entwurfszyklen eingehalten"})
+        yield _sse_event("result", {"message": final_message, "runner": "Goose-Harness · geprüfter Agentenworkflow"})
+    except HTTPException as exc:
+        yield _sse_event("error", {"detail": str(exc.detail)})
+    except Exception:
+        log.exception("Agent workflow failed for %s", profile.id)
+        yield _sse_event("error", {"detail": "Der Agentenworkflow ist unerwartet fehlgeschlagen."})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pipeline = make_pipeline(PipelineConfig.from_env())
@@ -1531,16 +1673,17 @@ async def update_studio_settings(request: PersistentStudioSettings) -> dict:
 @app.post("/chat/stream")
 async def stream_chat(request: ChatRequest) -> StreamingResponse:
     """Provide genuine progress events for explicitly opt-in local agent workflows."""
-    if request.agent_id != NEWS_BRIEFING_AGENT_ID:
-        raise HTTPException(status_code=400, detail="Dieser Agent unterstützt keinen Fortschritts-Stream.")
+    if not request.agent_id:
+        raise HTTPException(status_code=400, detail="Für den Fortschritts-Stream muss ein Agent ausgewählt sein.")
     resolved = _find_chat_agent_profile(request.agent_id)
     if not resolved:
         raise HTTPException(status_code=404, detail="Der ausgewählte lokale Agent wurde nicht gefunden.")
-    profile, _ = resolved
+    profile, profile_path = resolved
     if not profile.streamProgress:
         raise HTTPException(status_code=400, detail="Der ausgewählte Agent ist nicht als Fortschritts-Workflow konfiguriert.")
+    events = _news_briefing_events(request, profile) if profile.id == NEWS_BRIEFING_AGENT_ID else _agent_workflow_events(request, profile, profile_path)
     return StreamingResponse(
-        _news_briefing_events(request, profile),
+        events,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
