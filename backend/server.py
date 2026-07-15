@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from calendar import monthrange
 from datetime import datetime, timedelta
 import gc
 import html
@@ -1112,13 +1113,89 @@ NEWS_BRIEFING_SECTIONS: tuple[tuple[str, str], ...] = (
     ("Region Stuttgart", "Aktuelle Nachrichten der letzten 24 Stunden Region Stuttgart Baden-Württemberg"),
     ("Wirtschaft & Finanzen", "Aktuelle Nachrichten der letzten 24 Stunden Wirtschaft Finanzen Börse Deutschland Welt"),
     ("Sport", "Aktuelle Nachrichten der letzten 24 Stunden VfB Stuttgart DFB Nationalmannschaft und wichtiger Sport"),
-    ("HfWU", "site:hfwu.de HfWU Nürtingen-Geislingen aktuelle Nachrichten der letzten 24 Stunden"),
+    ("HfWU", "site:hfwu.de/aktuelles HfWU Nürtingen-Geislingen aktuelle Hochschulmeldung der letzten 24 Stunden"),
+)
+MARKET_INDICES: tuple[tuple[str, str], ...] = (
+    ("DAX", "^GDAXI"),
+    ("Euro Stoxx 50", "^STOXX50E"),
+    ("S&P 500", "^GSPC"),
+    ("Nasdaq 100", "^NDX"),
+    ("Nikkei 225", "^N225"),
 )
 
 
 def _sse_event(event: str, payload: dict[str, object]) -> str:
     """Serialize a small server-sent event without exposing implementation state."""
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _format_market_number(value: float) -> str:
+    return f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _format_market_change(value: float | None) -> str:
+    return "n. v." if value is None else f"{value:+.2f} %".replace(".", ",")
+
+
+def _previous_calendar_month(value: datetime) -> datetime:
+    year = value.year if value.month > 1 else value.year - 1
+    month = value.month - 1 or 12
+    return value.replace(year=year, month=month, day=min(value.day, monthrange(year, month)[1]))
+
+
+def _filter_hfwu_news_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Accept only time-sensitive HfWU news, never static campus or study-program pages."""
+    keep_terms = ("aktuelles", "news", "presse", "meldung", "veranstaltung", "forschung", "projekt", "kooperation", "auszeichnung", "hochschule")
+    reject_terms = ("standort", "campus", "studiengang", "studium", "kontakt", "anfahrt", "adresse", "bewerbung", "impressum")
+    filtered: list[dict[str, str]] = []
+    for source in sources:
+        url = source["url"].casefold()
+        text = f"{source['title']} {source['snippet']}".casefold()
+        if "hfwu.de" not in url or any(term in text for term in reject_terms):
+            continue
+        if any(term in text or term in url for term in keep_terms):
+            filtered.append(source)
+    return filtered
+
+
+async def _market_snapshot() -> tuple[list[str], list[tuple[str, str]]]:
+    """Compute day and calendar-month changes from current public index time series."""
+    async def fetch_index(name: str, symbol: str) -> tuple[str, str, float, float | None, float | None] | None:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol.replace('^', '%5E')}?range=3mo&interval=1d"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0), headers={"User-Agent": "Bonsai-Image-Studio/1.0"}) as client:
+                response = await client.get(url)
+            response.raise_for_status()
+            result = response.json()["chart"]["result"][0]
+            meta = result["meta"]
+            timestamps = result["timestamp"]
+            closes = result["indicators"]["quote"][0]["close"]
+            dated_closes = [(datetime.fromtimestamp(stamp, BERLIN_TIMEZONE), float(close)) for stamp, close in zip(timestamps, closes, strict=True) if close is not None]
+            if not dated_closes:
+                return None
+            latest_time, latest_close = dated_closes[-1]
+            current = float(meta.get("regularMarketPrice") or latest_close)
+            previous = float(meta["chartPreviousClose"]) if meta.get("chartPreviousClose") else None
+            target = _previous_calendar_month(latest_time)
+            month_candidates = [close for date, close in dated_closes if date <= target]
+            month_close = month_candidates[-1] if month_candidates else None
+            day_change = ((current / previous) - 1) * 100 if previous and previous > 0 else None
+            month_change = ((current / month_close) - 1) * 100 if month_close and month_close > 0 else None
+            return name, symbol, current, day_change, month_change
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+            log.info("Market snapshot unavailable for %s", symbol)
+            return None
+
+    values = await asyncio.gather(*(fetch_index(name, symbol) for name, symbol in MARKET_INDICES))
+    lines: list[str] = []
+    links: list[tuple[str, str]] = []
+    for value in values:
+        if not value:
+            continue
+        name, symbol, current, day_change, month_change = value
+        lines.append(f"- **{name}:** {_format_market_number(current)} Punkte · Tag {_format_market_change(day_change)} · Vormonat {_format_market_change(month_change)}")
+        links.append((name, f"https://finance.yahoo.com/quote/{symbol.replace('^', '%5E')}"))
+    return lines, links
 
 
 async def _local_llm_completion(
@@ -1160,6 +1237,8 @@ async def _news_briefing_sources(provider_choice: str) -> tuple[list[dict[str, s
             await asyncio.sleep(1.1)
     sources: list[dict[str, str]] = []
     for (section, _), (section_sources, _, _, _) in zip(NEWS_BRIEFING_SECTIONS, results, strict=True):
+        if section == "HfWU":
+            section_sources = _filter_hfwu_news_sources(section_sources)
         for source in section_sources:
             sources.append({**source, "section": section})
     unique: list[dict[str, str]] = []
@@ -1216,12 +1295,14 @@ async def _news_briefing_events(request: ChatRequest, profile: ChatAgentProfile)
             if not sources:
                 raise HTTPException(status_code=502, detail="Für das 24-Stunden-Briefing wurden keine verwertbaren Quellen gefunden.")
             source_context = _news_source_context(sources)
-            yield _sse_event("progress", {"step": 3, "total": 5, "label": "Erster Entwurf entsteht", "detail": f"{len(sources)} quellenbasierte Treffer im Zeitfenster"})
+            market_lines, market_links = await _market_snapshot()
+            yield _sse_event("progress", {"step": 3, "total": 5, "label": "Erster Entwurf entsteht", "detail": f"{len(sources)} quellenbasierte Treffer und {len(market_lines)} Marktindizes"})
             user_request = next((item.content for item in reversed(request.messages) if item.role == "user"), "")
             draft_prompt = "\n\n".join((
                 f"Zeitstempel: {timestamp}. Zeitraum: die letzten 24 Stunden.",
                 f"Nutzerauftrag: {user_request}",
-                "Erstelle ein kompaktes deutsches News-Briefing mit genau den Überschriften Welt, Deutschland, Region Stuttgart, Wirtschaft & Finanzen, Sport und HfWU. Nenne pro Bereich nur wirklich relevante und aktuelle Meldungen. Jede Tatsachenbehauptung trägt die passende Quellenmarkierung [n]. Wenn es keinen belastbaren aktuellen Treffer gibt, schreibe genau: Keine belastbare aktuelle Meldung gefunden.",
+                "Erstelle ein kompaktes deutsches News-Briefing mit genau den Überschriften Welt, Deutschland, Region Stuttgart, Wirtschaft & Finanzen, Sport und HfWU. Nenne pro Bereich nur wirklich relevante und aktuelle Meldungen. Jede Meldung besteht aus ein oder zwei klaren, aussagekräftigen Sätzen: Was ist konkret passiert, wer ist betroffen und warum ist es relevant? Vermeide vage Formulierungen wie 'erneut entfacht' ohne die konkrete Entwicklung zu nennen. Jede Tatsachenbehauptung trägt die passende Quellenmarkierung [n]. Im Bereich HfWU ausschließlich echte, aktuelle Hochschulmeldungen; nie Standort-, Campus-, Studiengangs-, Kontakt- oder Angebotsseiten. Wenn es keinen belastbaren aktuellen Treffer gibt, schreibe genau: Keine belastbare aktuelle Meldung gefunden.",
+                "Ein technisch berechneter Marktblock wird nach deinem Text ergänzt. Erfinde oder schätze keine Indexstände, Tages- oder Monatsveränderungen selbst.",
                 "Quellenmaterial:\n" + source_context,
             ))
             draft = await _local_llm_completion(
@@ -1235,7 +1316,7 @@ async def _news_briefing_events(request: ChatRequest, profile: ChatAgentProfile)
             for iteration in range(1, 4):
                 yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Qualitätsprüfung {iteration}/3", "detail": "Aktualität, Relevanz, Quellenbezug und Dopplungen"})
                 judge_prompt = "\n\n".join((
-                    "Prüfe den folgenden News-Entwurf ausschließlich gegen das Quellenmaterial. Prüfkriterien: letzte 24 Stunden, jede Tatsachenbehauptung durch passende [n]-Quelle gedeckt, alle sechs Überschriften vorhanden, keine Doppelungen, keine Spekulationen. Antworte ausschließlich als JSON: {\"verdict\":\"pass\"|\"revise\",\"issues\":[\"kurze konkrete Beanstandung\"]}.",
+                "Prüfe den folgenden News-Entwurf ausschließlich gegen das Quellenmaterial. Prüfkriterien: letzte 24 Stunden, jede Tatsachenbehauptung durch passende [n]-Quelle gedeckt, alle sechs Überschriften vorhanden, keine Doppelungen, keine Spekulationen und jede Meldung erklärt konkret was passiert ist. HfWU darf nur echte Hochschulmeldungen enthalten. Antworte ausschließlich als JSON: {\"verdict\":\"pass\"|\"revise\",\"issues\":[\"kurze konkrete Beanstandung\"]}.",
                     "ENTWURF:\n" + draft,
                     "QUELLEN:\n" + source_context,
                 ))
@@ -1252,7 +1333,7 @@ async def _news_briefing_events(request: ChatRequest, profile: ChatAgentProfile)
                     break
                 yield _sse_event("progress", {"step": 4, "total": 5, "label": f"Nachbesserung {iteration}/2", "detail": "; ".join(issues[:2]) or "Quellenbezug wird verdichtet"})
                 revision_prompt = "\n\n".join((
-                    "Überarbeite den Entwurf. Behalte nur nachweisbare aktuelle Inhalte, behalte alle sechs Überschriften und zitiere jede Tatsachenbehauptung als [n]. Gib nur den fertigen Bericht aus.",
+                    "Überarbeite den Entwurf. Behalte nur nachweisbare aktuelle Inhalte, behalte alle sechs Überschriften und zitiere jede Tatsachenbehauptung als [n]. Formuliere jede Meldung in ein oder zwei konkreten Sätzen. Gib nur den fertigen Bericht aus.",
                     "BEANSTANDUNGEN:\n" + "\n".join(f"- {issue}" for issue in issues),
                     "ENTWURF:\n" + draft,
                     "QUELLEN:\n" + source_context,
@@ -1265,7 +1346,9 @@ async def _news_briefing_events(request: ChatRequest, profile: ChatAgentProfile)
                     temperature=0.1,
                     max_tokens=1_600,
                 )
-            final_message = f"*Stand: {timestamp} · Zeitraum: letzte 24 Stunden*\n\n{draft.strip()}{_news_source_links(draft, sources)}"
+            market_block = "\n\n## Märkte\n" + "\n".join(market_lines) if market_lines else ""
+            market_sources = "\n".join(f"- [{name} – Marktzeitreihe]({url})" for name, url in market_links)
+            final_message = f"*Stand: {timestamp} · Zeitraum: letzte 24 Stunden*\n\n{draft.strip()}{market_block}{_news_source_links(draft, sources)}" + (f"\n\n### Marktquellen\n{market_sources}" if market_sources else "")
             yield _sse_event("progress", {"step": 5, "total": 5, "label": "Briefing geprüft und fertig", "detail": "Maximal drei Entwurfszyklen eingehalten"})
             yield _sse_event("result", {"message": final_message, "runner": "Lokaler News-Workflow · Bonsai-27B"})
         except HTTPException as exc:

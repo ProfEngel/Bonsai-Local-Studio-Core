@@ -22,8 +22,12 @@ def test_news_briefing_emits_progress_and_bounded_result(monkeypatch) -> None:
             return '{"verdict":"pass","issues":[]}'
         return "## Welt\nMeldung [1]\n\n## Deutschland\nMeldung [2]\n\n## Region Stuttgart\nMeldung [3]\n\n## Wirtschaft & Finanzen\nMeldung [4]\n\n## Sport\nMeldung [5]\n\n## HfWU\nMeldung [6]"
 
+    async def fake_market_snapshot():
+        return (["- **DAX:** 20.000,00 Punkte · Tag +1,00 % · Vormonat +2,00 %"], [("DAX", "https://example.test/dax")])
+
     monkeypatch.setattr(server, "_web_search", fake_search)
     monkeypatch.setattr(server, "_local_llm_completion", fake_completion)
+    monkeypatch.setattr(server, "_market_snapshot", fake_market_snapshot)
     request = server.ChatRequest(
         messages=[server.ChatMessage(role="user", content="Erstelle das News-Briefing.")],
         web_search=True,
@@ -47,5 +51,6 @@ def test_news_briefing_emits_progress_and_bounded_result(monkeypatch) -> None:
     events = asyncio.run(collect())
     assert events[-1]["runner"] == "Lokaler News-Workflow · Bonsai-27B"
     assert "### Quellen" in events[-1]["message"]
+    assert "## Märkte" in events[-1]["message"]
     assert any(event.get("label") == "Zeitstempel erfasst" for event in events)
     assert sum("ausschließlich als JSON" in call for call in calls) == 1
