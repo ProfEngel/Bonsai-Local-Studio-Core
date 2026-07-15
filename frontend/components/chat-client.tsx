@@ -296,7 +296,7 @@ export function ChatClient() {
           vision_llm_url: settings.visionLlmUrl,
           vision_model: settings.visionModel,
           agent_id: selectedAgent?.id,
-          system_prompt: selectedAgent?.systemPrompt,
+          system_prompt: settings.chatSystemPrompt,
         }),
       });
       const payload = await response.json().catch(() => null) as { message?: string; sources?: Source[]; runner?: string; detail?: string } | null;

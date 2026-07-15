@@ -7,6 +7,7 @@ export type StudioSettings = {
   visionLlmUrl: string;
   visionModel: string;
   webSearchProvider: "auto" | "tavily" | "brave" | "fallback";
+  chatSystemPrompt: string;
   systemPrompt: string;
 };
 
@@ -17,6 +18,8 @@ export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   visionLlmUrl: "http://127.0.0.1:8080/v1",
   visionModel: "Bonsai-27B-Q1_0.gguf",
   webSearchProvider: "auto",
+  chatSystemPrompt:
+    "Antworte kurz und direkt: normalerweise ein bis drei Sätze oder höchstens vier kurze Stichpunkte. Beginne sofort mit der Antwort. Keine Wiederholung der Frage, keine Selbstbeschreibung, keine Prozess- oder Tool-Erklärung und keine langen Standard-Hinweise. Wenn ein Entwurf, eine Analyse oder eine strukturierte Liste verlangt wird, liefere nur die dafür notwendigen Inhalte.",
   systemPrompt:
     "You improve prompts for a Flux2 Klein image model. Return exactly one English image prompt, one sentence, at most 60 words, with no repetition or explanation. Preserve the user's subject and intent; add useful visual details such as composition, lighting, materials and style.",
 };

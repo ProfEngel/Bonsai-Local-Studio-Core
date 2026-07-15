@@ -83,14 +83,14 @@ DEFAULT_PROMPT_OPTIMIZER_SYSTEM_PROMPT = (
 )
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
-    "You are Bonsai, a helpful local assistant. Answer clearly and honestly in the "
-    "user's language and use concise, well-formed Markdown. If WEB SEARCH RESULTS "
-    "are supplied, answer factual claims only from those results, cite them as [1], "
-    "[2] and do not use model memory. If the results do not answer the question, say "
-    "that the search was insufficient instead of inventing an answer. Interpret relative "
-    "dates such as today and yesterday from the supplied Europe/Berlin timestamp. "
-    "Image attachments are opaque to you: never claim to see, read or describe their "
-    "pixels. Ask for a local vision model when image analysis is required."
+    "Du bist Bonsai, ein lokaler Assistent. Antworte immer auf Deutsch, kurz und direkt: "
+    "normalerweise ein bis drei Sätze oder höchstens vier kurze Stichpunkte. Beginne mit "
+    "der Antwort; wiederhole die Frage nicht und gib keine Denkspur, Selbstbeschreibung, "
+    "Prozess- oder Tool-Erklärung aus. Wenn WEB SEARCH RESULTS vorliegen, verwende für "
+    "faktische Aussagen ausschließlich diese Quellen und zitiere sie als [1], [2]. Reichen "
+    "die Quellen nicht, sage das knapp statt etwas zu erfinden. Interpretiere relative Daten "
+    "mit dem gelieferten Zeitstempel Europe/Berlin. Bildanhänge darfst du nur dann beschreiben, "
+    "wenn eine lokale Vision-Auswertung als Kontext bereitgestellt wurde."
 )
 
 BERLIN_TIMEZONE = ZoneInfo("Europe/Berlin")
@@ -473,6 +473,7 @@ async def _run_goose_harness(
     profile_path: Path,
     messages: list[dict[str, str]],
     tool_context: str,
+    response_instruction: str,
 ) -> str:
     """Run one constrained, ephemeral Goose job without shell/computer extensions."""
     goose = shutil.which("goose") or "/opt/homebrew/bin/goose"
@@ -484,9 +485,10 @@ async def _run_goose_harness(
     )
     system = "\n\n".join(part for part in (
         "Du arbeitest als eingeschränkter Goose-Harness für einen lokalen BrainVault-Agenten.",
-        "Gib ausschließlich die fertige Antwort aus: keine Denkspur, keine Selbstanalyse, keine Tool-Planung und keinen englischen Meta-Kommentar.",
+        "Antworte immer auf Deutsch. Gib ausschließlich die fertige Antwort aus: keine Denkspur, keine Selbstanalyse, keine Tool-Planung und keinen englischen Meta-Kommentar.",
         "Du hast absichtlich keine Shell-, Computer- oder Versandwerkzeuge. Behaupte niemals, eine Mail gesendet, Dateien geändert oder andere externe Aktionen ausgeführt zu haben.",
         "Bei Mailentwürfen gilt: nur Entwurf; niemals versenden. Bei fehlenden Daten frage konkret nach.",
+        f"# Globale Antwortvorgabe (nur Stil; Sicherheitsregeln bleiben unverändert)\n{response_instruction}",
         f"# Agentenprofil: {profile.name}\n{profile.systemPrompt}",
         _agent_skill_context(profile_path),
         f"# Bereits vom lokalen, eingeschränkten Harness erhobene Fakten\n{tool_context}" if tool_context else "",
@@ -1173,6 +1175,7 @@ async def chat(request: ChatRequest) -> dict:
             profile_path=profile_path,
             messages=[item for item in messages if item["role"] != "system"],
             tool_context=tool_context,
+            response_instruction=request.system_prompt,
         )
         grounded_answer = _ground_unambiguous_score(answer, latest_question, sources)
         source_links = ""

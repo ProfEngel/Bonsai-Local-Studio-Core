@@ -141,6 +141,11 @@ export function SettingsClient() {
             <p className="text-xs text-muted">Automatisch nutzt Tavily, dann Brave, dann den transparent markierten öffentlichen Fallback. Bei Tavily oder Brave wird nur der aktuelle Suchprompt an den gewählten Anbieter gesendet.</p>
           </div>
           <label className="block space-y-2 text-sm font-medium">
+            Chat-Systemanweisung
+            <Textarea className="min-h-[150px] rounded-xl text-sm leading-6" value={settings.chatSystemPrompt} onChange={(event) => update("chatSystemPrompt", event.target.value)} />
+            <span className="block text-xs font-normal text-muted">Gilt für den allgemeinen Chat und zusätzlich für alle Agentenläufe. Die Antworten bleiben immer deutsch; Sicherheitsregeln der Agenten werden dadurch nicht geändert.</span>
+          </label>
+          <label className="block space-y-2 text-sm font-medium">
             Optimizer instruction
             <Textarea className="min-h-[160px] rounded-xl text-sm leading-6" value={settings.systemPrompt} onChange={(event) => update("systemPrompt", event.target.value)} />
           </label>
