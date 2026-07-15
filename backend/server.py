@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import time
 import xml.etree.ElementTree as ET
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -98,6 +100,11 @@ CHAT_AGENTS_DIR = Path(
         str(Path.home() / ".bonsai-studio" / "agents"),
     )
 ).expanduser()
+GOOSE_PROVIDER = os.getenv("BONSAI_GOOSE_PROVIDER", "custom_bonsai27b_2bit")
+GOOSE_MODEL = os.getenv("BONSAI_GOOSE_MODEL", "Ternary-Bonsai-27B-mlx-2bit")
+MAIL_ACCOUNT = os.getenv("BONSAI_MAIL_ACCOUNT", "Exchange")
+MAIL_INBOX = os.getenv("BONSAI_MAIL_INBOX", "Posteingang")
+_goose_agent_locks: dict[str, asyncio.Lock] = {}
 WEB_SEARCH_CONFIG_PATH = Path(
     os.getenv(
         "BONSAI_WEB_SEARCH_CONFIG",
@@ -304,6 +311,7 @@ class ChatRequest(BaseModel):
     attachments: list[ChatAttachment] = Field(default_factory=list, max_length=5)
     web_search: bool = False
     web_search_provider: Literal["auto", "tavily", "brave", "fallback"] = "auto"
+    agent_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
     llm_url: str = Field(min_length=1, max_length=512)
     model: str = Field(min_length=1, max_length=512)
     vision_llm_url: str | None = Field(default=None, max_length=512)
@@ -356,6 +364,200 @@ def _chat_agent_profiles() -> list[dict[str, str | bool]]:
             continue
         profiles.append(profile.model_dump())
     return profiles
+
+
+def _find_chat_agent_profile(agent_id: str) -> tuple[ChatAgentProfile, Path] | None:
+    """Resolve an explicitly selected local profile; never execute profile files."""
+    if not CHAT_AGENTS_DIR.is_dir():
+        return None
+    for profile_path in sorted(CHAT_AGENTS_DIR.rglob("chat/profile.json")):
+        try:
+            profile = ChatAgentProfile.model_validate_json(profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if profile.id == agent_id:
+            return profile, profile_path
+    return None
+
+
+def _agent_skill_context(profile_path: Path, *, limit: int = 12_000) -> str:
+    """Load the selected agent's small, declarative rule files for Goose context."""
+    # A profile may live in a command subfolder (for example Mail-Agent /
+    # commands / mailrundruf / chat). Use the nearest actual agent root so its
+    # shared SKILL.md, rules and workflows are not silently skipped.
+    agent_dir = next(
+        (parent for parent in profile_path.parents if (parent / "agent.yaml").is_file()),
+        profile_path.parent.parent,
+    )
+    candidates = [agent_dir / "SKILL.md"]
+    candidates.extend(sorted((agent_dir / "rules").glob("*.md")) if (agent_dir / "rules").is_dir() else [])
+    candidates.extend(sorted((agent_dir / "workflows").glob("*.md")) if (agent_dir / "workflows").is_dir() else [])
+    parts: list[str] = []
+    used = 0
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        excerpt = text[: max(0, limit - used)]
+        parts.append(f"## {candidate.name}\n{excerpt}")
+        used += len(excerpt)
+        if used >= limit:
+            break
+    return "\n\n".join(parts)
+
+
+def _is_unread_mail_question(question: str) -> bool:
+    lowered = question.casefold()
+    mail_terms = ("mail", "e-mail", "email", "posteingang", "inbox", "nachricht")
+    unread_terms = ("neu", "ungelesen", "unread", "eingang", "aktuell", "heute")
+    return any(term in lowered for term in mail_terms) and any(term in lowered for term in unread_terms)
+
+
+def _read_unread_mail_summary(max_items: int = 10) -> str:
+    """Read subject metadata only. This AppleScript never changes Mail state."""
+    safe_max = max(1, min(max_items, 20))
+    # Asking Mail for *all* matching message objects is surprisingly slow on a
+    # large Exchange mailbox. Count the matches, then inspect only the most
+    # recent fixed window. This keeps the connector both read-only and usable.
+    recent_window = max(30, safe_max * 4)
+    script = f'''
+tell application "Mail"
+  set mailboxRef to mailbox "{MAIL_INBOX}" of account "{MAIL_ACCOUNT}"
+  set itemCount to count of (every message of mailboxRef whose read status is false)
+  set outputText to ""
+  set shownCount to 0
+  set recentMessages to messages 1 thru {recent_window} of mailboxRef
+  repeat with currentMessage in recentMessages
+    if read status of currentMessage is false then
+      set outputText to outputText & (date received of currentMessage as string) & tab & (sender of currentMessage as string) & tab & (subject of currentMessage as string) & linefeed
+      set shownCount to shownCount + 1
+      if shownCount = {safe_max} then exit repeat
+    end if
+  end repeat
+  return (itemCount as text) & linefeed & outputText
+end tell
+'''
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"Apple Mail konnte nicht lesend abgefragt werden: {exc}"
+    rows = [row for row in result.stdout.splitlines() if row.strip()]
+    if not rows:
+        return "Apple Mail hat keine verwertbare Antwort geliefert."
+    try:
+        total = int(rows[0])
+    except ValueError:
+        return "Apple Mail lieferte kein lesbares Ergebnis."
+    if total == 0:
+        return "Posteingang (nur lesend geprüft): keine ungelesenen Nachrichten."
+    messages = []
+    for row in rows[1:]:
+        date_value, sender, subject = (row.split("\t", 2) + ["", "", ""])[:3]
+        messages.append(f"- {date_value}: {sender} — {subject}")
+    omitted = f"\nWeitere ungelesene Nachrichten: {total - len(messages)}." if total > len(messages) else ""
+    return f"Posteingang (nur lesend geprüft): {total} ungelesene Nachricht(en).\n" + "\n".join(messages) + omitted
+
+
+async def _run_goose_harness(
+    *,
+    profile: ChatAgentProfile,
+    profile_path: Path,
+    messages: list[dict[str, str]],
+    tool_context: str,
+) -> str:
+    """Run one constrained, ephemeral Goose job without shell/computer extensions."""
+    goose = shutil.which("goose") or "/opt/homebrew/bin/goose"
+    if not Path(goose).is_file():
+        raise HTTPException(status_code=503, detail="Goose ist lokal nicht verfügbar. Bitte Goose installieren oder den allgemeinen Chat verwenden.")
+    history = "\n\n".join(
+        f"{'Nutzer' if item['role'] == 'user' else 'Assistent'}: {item['content']}"
+        for item in messages[-12:]
+    )
+    system = "\n\n".join(part for part in (
+        "Du arbeitest als eingeschränkter Goose-Harness für einen lokalen BrainVault-Agenten.",
+        "Gib ausschließlich die fertige Antwort aus: keine Denkspur, keine Selbstanalyse, keine Tool-Planung und keinen englischen Meta-Kommentar.",
+        "Du hast absichtlich keine Shell-, Computer- oder Versandwerkzeuge. Behaupte niemals, eine Mail gesendet, Dateien geändert oder andere externe Aktionen ausgeführt zu haben.",
+        "Bei Mailentwürfen gilt: nur Entwurf; niemals versenden. Bei fehlenden Daten frage konkret nach.",
+        f"# Agentenprofil: {profile.name}\n{profile.systemPrompt}",
+        _agent_skill_context(profile_path),
+        f"# Bereits vom lokalen, eingeschränkten Harness erhobene Fakten\n{tool_context}" if tool_context else "",
+    ) if part)
+    lock = _goose_agent_locks.setdefault(profile.id, asyncio.Lock())
+    async with lock:
+        process = await asyncio.create_subprocess_exec(
+            goose,
+            "run",
+            "--no-profile",
+            "--no-session",
+            "--quiet",
+            "--max-turns",
+            "4",
+            "--provider",
+            GOOSE_PROVIDER,
+            "--model",
+            GOOSE_MODEL,
+            "--system",
+            system,
+            "--text",
+            history,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180)
+        except TimeoutError as exc:
+            process.kill()
+            await process.communicate()
+            raise HTTPException(status_code=504, detail="Der Goose-Agentenlauf hat zu lange gedauert.") from exc
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["unbekannter Fehler"]
+        raise HTTPException(status_code=502, detail=f"Goose-Harness fehlgeschlagen: {detail[0][:400]}")
+    answer = stdout.decode("utf-8", "replace").strip()
+    answer = re.sub(r"<think>.*?</think>\s*", "", answer, flags=re.IGNORECASE | re.DOTALL).strip()
+    if not answer:
+        raise HTTPException(status_code=502, detail="Goose-Harness lieferte keine nutzbare Antwort.")
+    return answer
+
+
+async def _vision_summary_for_harness(
+    *,
+    endpoint: str,
+    model: str,
+    attachments: list[ChatAttachment],
+) -> str:
+    """Turn local image pixels into bounded factual context before a Goose run."""
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Describe only visible image details in German. Do not diagnose, identify people, or expose reasoning."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Erstelle eine kurze, sachliche Bildbeschreibung für den nachfolgenden lokalen Agenten."},
+                *[{"type": "image_url", "image_url": {"url": item.data_url}} for item in attachments if item.data_url],
+            ]},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 500,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
+            response = await client.post(f"{endpoint}/chat/completions", json=body)
+        response.raise_for_status()
+        summary = response.json()["choices"][0]["message"]["content"]
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Lokale Vision-Auswertung fehlgeschlagen: {exc}") from exc
+    if not isinstance(summary, str) or not summary.strip():
+        raise HTTPException(status_code=502, detail="Lokale Vision-Auswertung lieferte keine Bildbeschreibung.")
+    return re.sub(r"<think>.*?</think>\s*", "", summary, flags=re.IGNORECASE | re.DOTALL).strip()
 
 
 def _plain_html(value: str) -> str:
@@ -909,7 +1111,8 @@ async def chat(request: ChatRequest) -> dict:
     search_provider = ""
     image_attachments = [item for item in request.attachments if item.kind == "image" and item.data_url]
     vision_enabled = bool(image_attachments and request.vision_llm_url and request.vision_model)
-    extra_context = _attachment_context(request.attachments, vision_enabled=vision_enabled)
+    attachment_context_items = [item for item in request.attachments if item.kind != "image"] if request.agent_id else request.attachments
+    extra_context = _attachment_context(attachment_context_items, vision_enabled=vision_enabled)
     if request.web_search:
         latest_question = next(
             (message.content for message in reversed(request.messages) if message.role == "user"),
@@ -943,6 +1146,43 @@ async def chat(request: ChatRequest) -> dict:
             if message["role"] == "user":
                 message["content"] = f"{message['content']}\n\n{extra_context}"
                 break
+
+    if request.agent_id:
+        resolved = _find_chat_agent_profile(request.agent_id)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Der ausgewählte lokale Agent wurde nicht gefunden.")
+        profile, profile_path = resolved
+        latest_question = next(
+            (message.content for message in reversed(request.messages) if message.role == "user"),
+            "",
+        )
+        tool_context = ""
+        if profile.id == "mailrundruf" and _is_unread_mail_question(latest_question):
+            tool_context = await asyncio.to_thread(_read_unread_mail_summary)
+        if image_attachments:
+            if not vision_enabled:
+                raise HTTPException(status_code=422, detail="Bildanalyse im Goose-Agentenlauf benötigt den lokalen Vision-Endpunkt in den Studio-Einstellungen.")
+            vision_summary = await _vision_summary_for_harness(
+                endpoint=request.vision_llm_url or request.llm_url,
+                model=request.vision_model or request.model,
+                attachments=image_attachments,
+            )
+            tool_context = "\n\n".join(part for part in (tool_context, f"Lokale Vision-Auswertung:\n{vision_summary}") if part)
+        answer = await _run_goose_harness(
+            profile=profile,
+            profile_path=profile_path,
+            messages=[item for item in messages if item["role"] != "system"],
+            tool_context=tool_context,
+        )
+        grounded_answer = _ground_unambiguous_score(answer, latest_question, sources)
+        source_links = ""
+        if sources:
+            provider_note = f"*Recherche: {search_provider}.*\n\n" if search_provider else ""
+            source_links = f"\n\n{provider_note}### Quellen\n" + "\n".join(
+                f"[{index}] [{source['title']}]({source['url']})"
+                for index, source in enumerate(sources, start=1)
+            )
+        return {"message": f"{grounded_answer}{source_links}", "sources": sources, "runner": "Goose-Harness"}
 
     endpoint = request.llm_url
     model = request.model

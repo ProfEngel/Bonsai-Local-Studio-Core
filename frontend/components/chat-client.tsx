@@ -27,6 +27,7 @@ type ChatMessage = {
   createdAt: string;
   attachments?: Attachment[];
   sources?: Source[];
+  runner?: string;
 };
 type Conversation = { id: string; title: string; createdAt: string; updatedAt: string; messages: ChatMessage[] };
 
@@ -294,13 +295,14 @@ export function ChatClient() {
           model: settings.model,
           vision_llm_url: settings.visionLlmUrl,
           vision_model: settings.visionModel,
+          agent_id: selectedAgent?.id,
           system_prompt: selectedAgent?.systemPrompt,
         }),
       });
-      const payload = await response.json().catch(() => null) as { message?: string; sources?: Source[]; detail?: string } | null;
+      const payload = await response.json().catch(() => null) as { message?: string; sources?: Source[]; runner?: string; detail?: string } | null;
       if (!response.ok || !payload?.message) throw new Error(parseError(payload, "Bonsai-27B hat keine Antwort geliefert."));
       const answer: ChatMessage = {
-        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), sources: payload.sources ?? [],
+        id: makeId(), role: "assistant", content: payload.message, createdAt: new Date().toISOString(), sources: payload.sources ?? [], runner: payload.runner,
       };
       setConversations((current) => current.map((conversation) => conversation.id === conversationId ? {
         ...conversation, updatedAt: answer.createdAt, messages: [...conversation.messages, answer],
@@ -339,6 +341,7 @@ export function ChatClient() {
             <div className="flex-1 space-y-4 overflow-y-auto px-4 py-5 sm:px-6">
               {activeConversation?.messages.length ? activeConversation.messages.map((message) => (
                 <article key={message.id} className={cn("max-w-[90%] rounded-2xl px-4 py-3 text-sm", message.role === "user" ? "ml-auto bg-cta-bg text-cta-ink" : "border border-border bg-surface-strong text-foreground")}>
+                  {message.runner ? <p className="mb-2 text-[10px] font-medium uppercase tracking-[0.12em] text-muted">{message.runner}</p> : null}
                   <ReactMarkdown
                     components={{
                       p: ({ children }) => <p className="mb-2 whitespace-pre-wrap leading-6 last:mb-0">{children}</p>,
@@ -353,13 +356,13 @@ export function ChatClient() {
                   {message.sources?.length ? <div className="mt-3 space-y-2 border-t border-border pt-2 text-xs text-muted">{message.sources.map((source) => <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="block hover:text-foreground"><span className="font-medium text-muted-strong">{source.title}</span>{source.snippet ? <span className="block mt-0.5">{source.snippet}</span> : null}</a>)}</div> : null}
                 </article>
               )) : <div className="grid h-full place-items-center text-center text-sm text-muted"><div><MessageCircle className="mx-auto mb-3 size-7" />Beginne eine lokale Unterhaltung mit Bonsai-27B.</div></div>}
-              {isSending ? <div className="flex items-center gap-2 text-sm text-muted"><LoaderCircle className="size-4 animate-spin" />Bonsai denkt nach …</div> : null}
+              {isSending ? <div className="flex items-center gap-2 text-sm text-muted"><LoaderCircle className="size-4 animate-spin" />{selectedAgent ? "Goose-Harness führt den Agenten aus …" : "Bonsai antwortet …"}</div> : null}
               <div ref={messagesEndRef} />
             </div>
 
             <form ref={formRef} onSubmit={send} className="border-t border-border-strong p-4 sm:p-5">
               {agentProfiles.length ? <div className="mb-3 flex flex-wrap items-center gap-2"><span className="mr-1 text-xs text-muted">Agent:</span><button type="button" onClick={() => setSelectedAgentId(null)} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === null ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>Allgemein</button>{agentProfiles.map((agent) => <button key={agent.id} type="button" onClick={() => { setSelectedAgentId(agent.id); setWebSearch(agent.webSearchDefault); }} title={agent.description} className={cn("rounded-full border px-3 py-1.5 text-xs transition", selectedAgentId === agent.id ? "border-cta-bg bg-cta-bg text-cta-ink" : "border-border bg-surface-strong text-muted hover:text-foreground")}>{agent.name}</button>)}</div> : null}
-              {selectedAgent ? <p className="mb-3 text-xs text-muted">{selectedAgent.description}{selectedAgent.webSearchDefault ? " Webrecherche ist für diesen Agenten voreingestellt." : ""}</p> : null}
+              {selectedAgent ? <p className="mb-3 text-xs text-muted">{selectedAgent.description} Dieser Agent läuft über den eingeschränkten Goose-Harness.{selectedAgent.webSearchDefault ? " Webrecherche ist für diesen Agenten voreingestellt." : ""}</p> : null}
               {attachments.length ? <div className="mb-3 flex flex-wrap gap-2">{attachments.map((attachment) => <span key={attachment.id} className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-surface-strong px-2 py-1 text-xs text-muted-strong">{attachment.kind === "image" && attachment.previewDataUrl ? <NextImage src={attachment.previewDataUrl} alt={`Vorschau von ${attachment.name}`} width={32} height={32} unoptimized className="size-8 rounded object-cover" /> : attachment.kind === "image" ? <ImageIcon className="size-3.5" /> : <FileText className="size-3.5" />}<span className="truncate">{attachment.name}</span><button type="button" onClick={() => removeAttachment(attachment.id)} aria-label={`${attachment.name} entfernen`} className="text-muted hover:text-foreground"><X className="size-3" /></button></span>)}</div> : null}
               <Textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); formRef.current?.requestSubmit(); } }} placeholder="Schreibe eine Nachricht …" className="min-h-24 resize-y rounded-xl text-sm leading-6" disabled={isSending || isReadingFiles} />
               {error ? <p role="alert" className="mt-2 text-xs text-red-400">{error}</p> : null}
