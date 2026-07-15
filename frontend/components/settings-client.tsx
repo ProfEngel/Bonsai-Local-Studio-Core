@@ -13,6 +13,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 
+const BONSAI_2BIT_SETTINGS = {
+  visionMode: "bonsai2bit" as const,
+  llmUrl: "http://127.0.0.1:8081/v1",
+  model: "Ternary-Bonsai-27B-mlx-2bit",
+  visionLlmUrl: "http://127.0.0.1:8080/v1",
+  visionModel: "Ternary-Bonsai-27B-mlx-2bit",
+};
+
 export function SettingsClient() {
   const [settings, setSettings] = useState<StudioSettings>(DEFAULT_STUDIO_SETTINGS);
   const [saved, setSaved] = useState(false);
@@ -61,6 +69,13 @@ export function SettingsClient() {
   const update = <K extends keyof StudioSettings>(key: K, value: StudioSettings[K]) => {
     setSaved(false);
     setSettings((current) => ({ ...current, [key]: value }));
+  };
+
+  const selectVisionMode = (visionMode: StudioSettings["visionMode"]) => {
+    setSaved(false);
+    setSettings((current) => visionMode === "bonsai2bit"
+      ? { ...current, ...BONSAI_2BIT_SETTINGS }
+      : { ...current, visionMode: "custom" });
   };
 
   const save = async () => {
@@ -134,28 +149,33 @@ export function SettingsClient() {
               className="size-5 accent-[var(--accent)]"
             />
           </label>
-          <label className="block space-y-2 text-sm font-medium">
-            Local LLM endpoint
-            <Input value={settings.llmUrl} onChange={(event) => update("llmUrl", event.target.value)} placeholder="http://127.0.0.1:8081/v1" />
-            <span className="block text-xs font-normal text-muted">Only local HTTP endpoints ending in <code>/v1</code> are accepted.</span>
-          </label>
-          <label className="block space-y-2 text-sm font-medium">
-            Model identifier
-            <Input value={settings.model} onChange={(event) => update("model", event.target.value)} />
-          </label>
-          <div className="space-y-4 rounded-xl border border-border-strong bg-surface-strong p-4">
-            <div>
-              <p className="text-sm font-semibold">Vision-Modell für Bilder</p>
-              <p className="mt-1 text-xs text-muted">Text und Bildanalyse gehen über die passenden lokalen Endpunkte des Bonsai‑2Bit-Vision-Servers.</p>
-            </div>
+          <div className="space-y-3 rounded-xl border border-border-strong bg-surface-strong p-4">
             <label className="block space-y-2 text-sm font-medium">
-              Vision endpoint
-              <Input value={settings.visionLlmUrl} onChange={(event) => update("visionLlmUrl", event.target.value)} placeholder="http://127.0.0.1:8080/v1" />
+              Lokales Modell
+              <select value={settings.visionMode} onChange={(event) => selectVisionMode(event.target.value as StudioSettings["visionMode"])} className="flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground">
+                <option value="bonsai2bit">Bonsai‑27B 2Bit mit Vision (empfohlen)</option>
+                <option value="custom">Eigenes Modell / eigener Vision-Server</option>
+              </select>
             </label>
-            <label className="block space-y-2 text-sm font-medium">
-              Vision model identifier
-              <Input value={settings.visionModel} onChange={(event) => update("visionModel", event.target.value)} />
-            </label>
+            {settings.visionMode === "bonsai2bit" ? <p className="text-xs text-muted">Ein gemeinsames Modell: Text über <code>127.0.0.1:8081</code>, Bilder über <code>127.0.0.1:8080</code>. Die Vision-Erweiterung ist bereits enthalten.</p> : <div className="space-y-4">
+              <label className="block space-y-2 text-sm font-medium">
+                Local LLM endpoint
+                <Input value={settings.llmUrl} onChange={(event) => update("llmUrl", event.target.value)} placeholder="http://127.0.0.1:8081/v1" />
+                <span className="block text-xs font-normal text-muted">Only local HTTP endpoints ending in <code>/v1</code> are accepted.</span>
+              </label>
+              <label className="block space-y-2 text-sm font-medium">
+                Model identifier
+                <Input value={settings.model} onChange={(event) => update("model", event.target.value)} />
+              </label>
+              <label className="block space-y-2 text-sm font-medium">
+                Vision endpoint
+                <Input value={settings.visionLlmUrl} onChange={(event) => update("visionLlmUrl", event.target.value)} placeholder="http://127.0.0.1:8080/v1" />
+              </label>
+              <label className="block space-y-2 text-sm font-medium">
+                Vision model identifier
+                <Input value={settings.visionModel} onChange={(event) => update("visionModel", event.target.value)} />
+              </label>
+            </div>}
           </div>
           <div className="space-y-3 rounded-xl border border-border-strong bg-surface-strong p-4">
             <div>

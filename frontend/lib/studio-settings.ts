@@ -2,6 +2,7 @@ export const STUDIO_SETTINGS_STORAGE_KEY = "bonsai-studio-settings-v1";
 
 export type StudioSettings = {
   promptOptimizerEnabled: boolean;
+  visionMode: "bonsai2bit" | "custom";
   llmUrl: string;
   model: string;
   visionLlmUrl: string;
@@ -13,10 +14,11 @@ export type StudioSettings = {
 
 export const DEFAULT_STUDIO_SETTINGS: StudioSettings = {
   promptOptimizerEnabled: false,
+  visionMode: "bonsai2bit",
   llmUrl: "http://127.0.0.1:8081/v1",
-  model: "prism-ml/Bonsai-27B-mlx-1bit",
+  model: "Ternary-Bonsai-27B-mlx-2bit",
   visionLlmUrl: "http://127.0.0.1:8080/v1",
-  visionModel: "Bonsai-27B-Q1_0.gguf",
+  visionModel: "Ternary-Bonsai-27B-mlx-2bit",
   webSearchProvider: "auto",
   chatSystemPrompt:
     "Antworte kurz und direkt: normalerweise ein bis drei Sätze oder höchstens vier kurze Stichpunkte. Beginne sofort mit der Antwort. Keine Wiederholung der Frage, keine Selbstbeschreibung, keine Prozess- oder Tool-Erklärung und keine langen Standard-Hinweise. Wenn ein Entwurf, eine Analyse oder eine strukturierte Liste verlangt wird, liefere nur die dafür notwendigen Inhalte.",
@@ -30,7 +32,11 @@ export function readStudioSettings(): StudioSettings {
     const raw = window.localStorage.getItem(STUDIO_SETTINGS_STORAGE_KEY);
     if (!raw) return DEFAULT_STUDIO_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<StudioSettings>;
-    return { ...DEFAULT_STUDIO_SETTINGS, ...parsed };
+    const settings = { ...DEFAULT_STUDIO_SETTINGS, ...parsed };
+    if (!parsed.visionMode) {
+      settings.visionMode = settings.model.includes("Ternary-Bonsai-27B-mlx-2bit") ? "bonsai2bit" : "custom";
+    }
+    return settings;
   } catch {
     return DEFAULT_STUDIO_SETTINGS;
   }

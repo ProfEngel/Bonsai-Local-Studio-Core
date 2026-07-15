@@ -387,6 +387,7 @@ class PersistentStudioSettings(BaseModel):
     """Non-secret Studio preferences stored outside the updatable checkout."""
 
     promptOptimizerEnabled: bool
+    visionMode: Literal["bonsai2bit", "custom"] = "custom"
     llmUrl: str = Field(min_length=1, max_length=512)
     model: str = Field(min_length=1, max_length=512)
     visionLlmUrl: str = Field(min_length=1, max_length=512)
